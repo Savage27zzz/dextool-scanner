@@ -64,6 +64,7 @@ monitor_task: asyncio.Task | None = None
 whale_tracker: WhaleTracker | None = None
 whale_task: asyncio.Task | None = None
 is_running: bool = False
+_pending_buys: dict[str, str] = {}
 
 
 def _is_admin(update) -> bool:
@@ -767,6 +768,7 @@ async def cmd_buy(update, context):
         return
 
     tp = token_address[:16]
+    _pending_buys[f"{user_id}:{tp}"] = token_address
     keyboard = [
         [
             InlineKeyboardButton("✅ Confirm Buy", callback_data=f"buy_confirm:{tp}:{buy_amount}"),
@@ -1513,18 +1515,21 @@ async def _handle_sell_callback(query, user_id, token_prefix, percent):
 
 
 async def _handle_buy_confirm_callback(query, user_id, token_prefix, amount):
-    import aiosqlite
-    from db import DB_PATH
-    token_address = None
-    async with aiosqlite.connect(str(DB_PATH)) as conn:
-        conn.row_factory = aiosqlite.Row
-        cur = await conn.execute(
-            "SELECT contract_address FROM detected_tokens WHERE contract_address LIKE ? ORDER BY detected_at DESC LIMIT 1",
-            (token_prefix + "%",),
-        )
-        row = await cur.fetchone()
-        if row:
-            token_address = row["contract_address"]
+    cache_key = f"{user_id}:{token_prefix}"
+    token_address = _pending_buys.pop(cache_key, None)
+
+    if token_address is None:
+        import aiosqlite
+        from db import DB_PATH
+        async with aiosqlite.connect(str(DB_PATH)) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT contract_address FROM detected_tokens WHERE contract_address LIKE ? ORDER BY detected_at DESC LIMIT 1",
+                (token_prefix + "%",),
+            )
+            row = await cur.fetchone()
+            if row:
+                token_address = row["contract_address"]
     if token_address is None:
         positions = await db.get_open_positions(user_id=user_id)
         for p in positions:
