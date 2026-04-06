@@ -128,6 +128,38 @@ class Notifier:
         msg = f"⚠️ <b>ERROR</b>\n<code>{_esc(error_msg)}</code>"
         await self.send_message(msg)
 
+    async def notify_whale_alert(
+        self,
+        wallet_address: str,
+        wallet_label: str,
+        token_symbol: str,
+        token_mint: str,
+        sol_spent: float,
+        tokens_received: float,
+        tx_signature: str,
+        is_held: bool,
+    ):
+        solscan_url = f"https://solscan.io/tx/{tx_signature}"
+        short_wallet = wallet_address[:6] + "…" + wallet_address[-4:]
+        short_tx = tx_signature[:10] + "…" + tx_signature[-6:]
+        label_str = f" ({_esc(wallet_label)})" if wallet_label else ""
+        held_str = "🟢 YOU HOLD THIS TOKEN" if is_held else "👀 Token in watchlist"
+
+        msg = (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🐋 <b>WHALE BUY DETECTED</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👛 Wallet: <code>{short_wallet}</code>{label_str}\n"
+            f"🪙 Token: {_esc(token_symbol)}\n"
+            f"📄 Mint: <code>{_esc(token_mint)}</code>\n"
+            f"💰 SOL Spent: {sol_spent:.4f} SOL\n"
+            f"📦 Received: {_fmt_tokens(tokens_received)} tokens\n"
+            f"📍 {held_str}\n"
+            f'TX: <a href="{solscan_url}">{short_tx}</a>\n'
+            "━━━━━━━━━━━━━━━━━━━━━━"
+        )
+        await self.send_message(msg)
+
 
 def _esc(text) -> str:
     if text is None:
