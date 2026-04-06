@@ -518,19 +518,34 @@ async def cmd_portfolio(update, context):
 
         total_invested += invested
 
-        current_value = current * tokens if current > 0 else 0
+        if current > 0:
+            current_value = current * tokens
+            price_ok = True
+        else:
+            current_value = invested
+            price_ok = False
+
         total_current_value += current_value
 
         pnl = current_value - invested
         pnl_sign = "+" if pnl >= 0 else ""
 
-        arrow = "\U0001f7e2" if roi >= 0 else "\U0001f534"
-        position_lines.append(
+        if not price_ok:
+            arrow = "\u26a0\ufe0f"
+        elif roi >= 0:
+            arrow = "\U0001f7e2"
+        else:
+            arrow = "\U0001f534"
+
+        line = (
             f"{arrow} <b>{symbol}</b>\n"
             f"   Invested: {invested:.4f} {native}\n"
             f"   Value: {current_value:.4f} {native} ({pnl_sign}{pnl:.4f})\n"
             f"   ROI: {roi:+.2f}%"
         )
+        if not price_ok:
+            line += " \u26a0\ufe0f price unavailable"
+        position_lines.append(line)
 
     trades = await db.get_trade_history(limit=100)
     realized_pnl = 0.0
