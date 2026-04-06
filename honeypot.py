@@ -114,14 +114,15 @@ async def check_honeypot(session: aiohttp.ClientSession, chain: str, address: st
         sell_tax    (float) — sell tax percentage (0–100)
         checked     (bool)  — True if at least one API returned data
     """
-    result = await _check_dextools(session, chain, address)
-    if result["checked"]:
-        if result["is_honeypot"]:
-            logger.warning(
-                "HONEYPOT (DexTools): %s on %s — buy=%.1f%% sell=%.1f%%",
-                address, chain, result["buy_tax"], result["sell_tax"],
-            )
-        return result
+    if DEXTOOLS_API_KEY:
+        result = await _check_dextools(session, chain, address)
+        if result["checked"]:
+            if result["is_honeypot"]:
+                logger.warning(
+                    "HONEYPOT (DexTools): %s on %s — buy=%.1f%% sell=%.1f%%",
+                    address, chain, result["buy_tax"], result["sell_tax"],
+                )
+            return result
 
     result = await _check_goplus(session, chain, address)
     if result["checked"]:

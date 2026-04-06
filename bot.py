@@ -10,6 +10,7 @@ import db
 from config import (
     BUY_PERCENT,
     CHAIN,
+    DEXTOOLS_API_KEY,
     EXPLORER_TX,
     MAX_MCAP,
     MIN_LIQUIDITY,
@@ -314,6 +315,7 @@ async def cmd_config(update, context):
     msg = (
         "⚙️ <b>Configuration</b>\n\n"
         f"Chain: {CHAIN}\n"
+        f"Scanner Mode: {'DexTools + DexScreener' if DEXTOOLS_API_KEY else 'DexScreener only'}\n"
         f"Buy Percent: {BUY_PERCENT}%\n"
         f"Take Profit: {TAKE_PROFIT}%\n"
         f"Stop Loss: {STOP_LOSS}%\n"
@@ -818,9 +820,11 @@ async def post_init(application):
         balance = await trader.get_balance(CHAIN)
 
     logger.info("Bot initialised – chain=%s, balance=%.6f %s", CHAIN, balance, native)
+    scanner_mode = "DexTools + DexScreener" if DEXTOOLS_API_KEY else "DexScreener only (free)"
     await notifier.send_message(
         f"🤖 <b>DexTool Scanner Online</b>\n"
         f"Chain: {CHAIN} | Balance: {balance:.4f} {native}\n"
+        f"Scanner: {scanner_mode}\n"
         f"Send /start to begin scanning."
     )
 

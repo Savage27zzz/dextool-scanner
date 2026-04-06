@@ -23,8 +23,11 @@ Automated Telegram trading bot that scans DexTools for newly launched low-cap to
 - Python 3.11+
 - A funded Solana wallet (or ETH/BSC wallet if using EVM chains)
 - Telegram bot token (from [@BotFather](https://t.me/BotFather))
-- DexTools API key ([developer.dextools.io](https://developer.dextools.io))
 - Solana RPC endpoint (public, or Helius/QuickNode for better reliability)
+- *(Optional)* DexTools API key ([developer.dextools.io](https://developer.dextools.io)) — paid plans only; bot works without it using DexScreener's free API
+
+> **Required:** `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `PRIVATE_KEY`
+> **Optional:** `DEXTOOLS_API_KEY` (paid — bot works without it using DexScreener's free API)
 
 ## Installation
 
@@ -50,7 +53,7 @@ Edit `.env` with your values:
 | `RPC_URL_SOL` | Solana RPC endpoint | `https://api.mainnet-beta.solana.com` |
 | `RPC_URL_ETH` | Ethereum RPC (optional) | — |
 | `RPC_URL_BSC` | BSC RPC (optional) | — |
-| `DEXTOOLS_API_KEY` | DexTools API key | *required* |
+| `DEXTOOLS_API_KEY` | DexTools API key (optional — enables richer data) | — |
 | `DEXTOOLS_PLAN` | DexTools plan tier (`trial`, `standard`, etc.) | `trial` |
 | `CHAIN` | Active chain: `SOL`, `ETH`, or `BSC` | `SOL` |
 | `BUY_PERCENT` | % of wallet balance to use per trade | `50` |

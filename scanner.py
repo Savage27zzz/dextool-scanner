@@ -355,15 +355,20 @@ async def scan_all_sources(session: aiohttp.ClientSession, chain: str | None = N
     """
     chain = (chain or CHAIN).upper()
 
-    dextools_results, dexscreener_results = await asyncio.gather(
-        scan_for_new_tokens(session, chain),
-        scan_dexscreener(session, chain),
-        return_exceptions=True,
-    )
-
-    if isinstance(dextools_results, Exception):
-        logger.error("DexTools scanner failed: %s", dextools_results)
+    if DEXTOOLS_API_KEY:
+        dextools_results, dexscreener_results = await asyncio.gather(
+            scan_for_new_tokens(session, chain),
+            scan_dexscreener(session, chain),
+            return_exceptions=True,
+        )
+        if isinstance(dextools_results, Exception):
+            logger.error("DexTools scanner failed: %s", dextools_results)
+            dextools_results = []
+    else:
+        logger.info("DexTools API key not configured \u2014 using DexScreener only")
         dextools_results = []
+        dexscreener_results = await scan_dexscreener(session, chain)
+
     if isinstance(dexscreener_results, Exception):
         logger.error("DexScreener scanner failed: %s", dexscreener_results)
         dexscreener_results = []

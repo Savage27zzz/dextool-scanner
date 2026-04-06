@@ -31,7 +31,7 @@ RPC_URL_SOL: str = _env("RPC_URL_SOL", default="https://api.mainnet-beta.solana.
 RPC_URL_ETH: str = _env("RPC_URL_ETH", default="")
 RPC_URL_BSC: str = _env("RPC_URL_BSC", default="")
 
-DEXTOOLS_API_KEY: str = _env("DEXTOOLS_API_KEY", required=True)
+DEXTOOLS_API_KEY: str = _env("DEXTOOLS_API_KEY", default="")
 DEXTOOLS_PLAN: str = _env("DEXTOOLS_PLAN", default="trial")
 
 CHAIN: str = _env("CHAIN", default="SOL")
