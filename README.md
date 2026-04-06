@@ -90,6 +90,7 @@ The bot will connect to Telegram and send a startup message. Use commands to con
 | `/stop` | Stop scanning (bot stays responsive) |
 | `/buy <address> [amount]` | Manually buy a token. Amount in SOL/ETH/BNB (default: configured %) |
 | `/sell <address> [percent]` | Manually sell a token. Percent 1-100 (default: 100%) |
+| `/portfolio` | Full portfolio overview: wallet balance, positions value, PnL breakdown, win rate |
 | `/adduser <id>` | Grant a friend read-only access |
 | `/removeuser <id>` | Revoke a user's access |
 | `/users` | List all authorized users |

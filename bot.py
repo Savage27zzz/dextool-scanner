@@ -144,6 +144,7 @@ async def cmd_help(update, context):
         lines.append("/config — Current bot configuration")
         lines.append("/buy &lt;address&gt; [amount] — Manual buy")
         lines.append("/sell &lt;address&gt; [percent] — Manual sell")
+        lines.append("/portfolio — Full portfolio overview with PnL")
         if is_admin:
             lines.append("\n<b>Admin only:</b>")
             lines.append("/start — Start scanning and trading")
@@ -489,6 +490,103 @@ async def cmd_sell(update, context):
     logger.info("Manual sell executed: %s (%d%%), tx=%s", token_address, sell_percent, result["tx_hash"])
 
 
+async def cmd_portfolio(update, context):
+    if not _is_admin(update):
+        await update.message.reply_text("Admin only.")
+        return
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+
+    if CHAIN.upper() == "SOL":
+        wallet_balance = await trader.get_balance()
+    else:
+        wallet_balance = await trader.get_balance(CHAIN)
+
+    positions = await monitor.get_positions_with_roi()
+
+    total_invested = 0.0
+    total_current_value = 0.0
+
+    position_lines = []
+    for p in positions:
+        invested = p.get("buy_amount_native", 0)
+        tokens = p.get("tokens_received", 0)
+        entry = p.get("entry_price", 0)
+        current = p.get("current_price", 0)
+        roi = p.get("roi", 0)
+        symbol = p.get("token_symbol", "???")
+
+        total_invested += invested
+
+        current_value = current * tokens if current > 0 else 0
+        total_current_value += current_value
+
+        pnl = current_value - invested
+        pnl_sign = "+" if pnl >= 0 else ""
+
+        arrow = "\U0001f7e2" if roi >= 0 else "\U0001f534"
+        position_lines.append(
+            f"{arrow} <b>{symbol}</b>\n"
+            f"   Invested: {invested:.4f} {native}\n"
+            f"   Value: {current_value:.4f} {native} ({pnl_sign}{pnl:.4f})\n"
+            f"   ROI: {roi:+.2f}%"
+        )
+
+    trades = await db.get_trade_history(limit=100)
+    realized_pnl = 0.0
+    total_trades = len(trades)
+    winning_trades = 0
+    for t in trades:
+        buy_native = t.get("buy_amount_native", 0)
+        sell_native = t.get("sell_amount_native", 0)
+        realized_pnl += (sell_native - buy_native)
+        if t.get("roi_percent", 0) > 0:
+            winning_trades += 1
+
+    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+
+    unrealized_pnl = total_current_value - total_invested
+    overall_pnl = unrealized_pnl + realized_pnl
+    overall_sign = "+" if overall_pnl >= 0 else ""
+    unrealized_sign = "+" if unrealized_pnl >= 0 else ""
+    realized_sign = "+" if realized_pnl >= 0 else ""
+
+    total_portfolio = wallet_balance + total_current_value
+
+    msg_parts = [
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        "\U0001f4bc <b>PORTFOLIO OVERVIEW</b>",
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        f"",
+        f"\U0001f4b0 Wallet: {wallet_balance:.4f} {native}",
+        f"\U0001f4e6 In Positions: {total_current_value:.4f} {native}",
+        f"\U0001f4ca Total Value: {total_portfolio:.4f} {native}",
+        f"",
+        f"<b>PnL Summary</b>",
+        f"   Unrealized: {unrealized_sign}{unrealized_pnl:.4f} {native}",
+        f"   Realized: {realized_sign}{realized_pnl:.4f} {native}",
+        f"   Overall: {overall_sign}{overall_pnl:.4f} {native}",
+        f"",
+        f"<b>Stats</b>",
+        f"   Open Positions: {len(positions)}",
+        f"   Completed Trades: {total_trades}",
+        f"   Win Rate: {win_rate:.1f}%",
+    ]
+
+    if position_lines:
+        msg_parts.append("")
+        msg_parts.append("\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501")
+        msg_parts.append("\U0001f4cb <b>OPEN POSITIONS</b>")
+        msg_parts.append("\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501")
+        for line in position_lines:
+            msg_parts.append(line)
+    else:
+        msg_parts.append("")
+        msg_parts.append("No open positions.")
+
+    await update.message.reply_html("\n".join(msg_parts))
+
+
 async def cmd_adduser(update, context):
     if not _is_admin(update):
         await update.message.reply_text("Admin only.")
@@ -602,6 +700,7 @@ def main():
     app.add_handler(CommandHandler("config", cmd_config))
     app.add_handler(CommandHandler("buy", cmd_buy))
     app.add_handler(CommandHandler("sell", cmd_sell))
+    app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     app.add_handler(CommandHandler("adduser", cmd_adduser))
     app.add_handler(CommandHandler("removeuser", cmd_removeuser))
     app.add_handler(CommandHandler("users", cmd_users))
