@@ -338,8 +338,7 @@ async def cmd_config(update, context):
 
 
 async def cmd_buy(update, context):
-    if not _is_admin(update):
-        await update.message.reply_text("Admin only.")
+    if await _reject_unauthorized(update):
         return
 
     if not context.args or len(context.args) < 1:
@@ -441,8 +440,7 @@ async def cmd_buy(update, context):
 
 
 async def cmd_sell(update, context):
-    if not _is_admin(update):
-        await update.message.reply_text("Admin only.")
+    if await _reject_unauthorized(update):
         return
 
     if not context.args or len(context.args) < 1:
