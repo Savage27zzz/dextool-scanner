@@ -122,7 +122,7 @@ class ProfitMonitor:
                             chain=chain,
                         )
 
-                elif roi <= STOP_LOSS:
+                elif STOP_LOSS < 0 and roi <= STOP_LOSS:
                     logger.info("SL hit for %s – ROI %.2f%% <= %d%%", symbol, roi, STOP_LOSS)
                     sell_result = await self._execute_sell_and_close(pos, roi, "Stop-loss")
                     if sell_result:
