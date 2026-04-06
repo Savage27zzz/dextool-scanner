@@ -470,7 +470,7 @@ async def cmd_sell(update, context):
                     "sell_tx_hash": result["tx_hash"],
                     "duration_seconds": duration_seconds,
                 }
-                await db.close_position(token_address, CHAIN.upper(), exit_data)
+                await db.close_position(pos["token_address"], CHAIN.upper(), exit_data)
                 break
 
     tx_url = EXPLORER_TX.get(CHAIN.upper(), EXPLORER_TX["SOL"]).format(result["tx_hash"])
