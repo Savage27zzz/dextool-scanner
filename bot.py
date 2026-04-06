@@ -99,6 +99,10 @@ async def scanner_loop():
 
 
 async def cmd_start(update, context):
+    if update.effective_chat.id != TELEGRAM_CHAT_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+
     global is_running, scanner_task, monitor_task
 
     if is_running:
@@ -128,6 +132,10 @@ async def cmd_start(update, context):
 
 
 async def cmd_stop(update, context):
+    if update.effective_chat.id != TELEGRAM_CHAT_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+
     global is_running, scanner_task, monitor_task
 
     if not is_running:
@@ -150,6 +158,10 @@ async def cmd_stop(update, context):
 
 
 async def cmd_status(update, context):
+    if update.effective_chat.id != TELEGRAM_CHAT_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+
     positions = await monitor.get_positions_with_roi()
 
     if not positions:
@@ -172,6 +184,10 @@ async def cmd_status(update, context):
 
 
 async def cmd_balance(update, context):
+    if update.effective_chat.id != TELEGRAM_CHAT_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
     if CHAIN.upper() == "SOL":
         balance = await trader.get_balance()
@@ -182,6 +198,10 @@ async def cmd_balance(update, context):
 
 
 async def cmd_history(update, context):
+    if update.effective_chat.id != TELEGRAM_CHAT_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+
     trades = await db.get_trade_history(limit=10)
 
     if not trades:
@@ -204,6 +224,10 @@ async def cmd_history(update, context):
 
 
 async def cmd_config(update, context):
+    if update.effective_chat.id != TELEGRAM_CHAT_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+
     msg = (
         "⚙️ <b>Configuration</b>\n\n"
         f"Chain: {CHAIN}\n"

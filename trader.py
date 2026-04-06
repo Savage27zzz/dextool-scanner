@@ -217,19 +217,36 @@ class SolanaTrader:
         return amount
 
     async def get_token_price_via_jupiter(self, token_mint: str) -> float:
+        """Return price as SOL per token (same unit as entry_price)."""
         try:
+            test_lamports = 100_000_000  # 0.1 SOL
             async with aiohttp.ClientSession() as session:
-                params = {"ids": token_mint}
-                async with session.get(JUPITER_PRICE_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                params = {
+                    "inputMint": WSOL_MINT,
+                    "outputMint": token_mint,
+                    "amount": str(test_lamports),
+                    "slippageBps": "100",
+                }
+                async with session.get(JUPITER_QUOTE_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status != 200:
-                        logger.warning("Jupiter price API returned %d for %s", resp.status, token_mint)
+                        logger.warning("Jupiter quote API returned %d for %s", resp.status, token_mint)
                         return 0.0
-                    data = await resp.json()
-                    token_data = data.get("data", {}).get(token_mint, {})
-                    price = token_data.get("price")
-                    if price is not None:
-                        return float(price)
-                    return 0.0
+                    quote = await resp.json()
+                    out_amount = int(quote.get("outAmount", 0))
+                    if out_amount <= 0:
+                        return 0.0
+
+                    _, decimals = await self.get_token_balance(token_mint)
+                    if decimals == 0:
+                        decimals = 9
+
+                    sol_amount = test_lamports / 1e9
+                    tokens_human = out_amount / (10 ** decimals)
+
+                    if tokens_human <= 0:
+                        return 0.0
+
+                    return sol_amount / tokens_human
         except Exception as exc:
             logger.error("get_token_price_via_jupiter error for %s: %s", token_mint, exc)
             return 0.0
