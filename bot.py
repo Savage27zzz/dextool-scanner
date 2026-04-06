@@ -14,7 +14,8 @@ from solana.rpc.commitment import Confirmed
 from solders.system_program import TransferParams, transfer
 from solders.transaction import Transaction
 from solders.message import Message
-from telegram.ext import Application, CommandHandler
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler
 
 import db
 from config import (
@@ -63,6 +64,7 @@ monitor_task: asyncio.Task | None = None
 whale_tracker: WhaleTracker | None = None
 whale_task: asyncio.Task | None = None
 is_running: bool = False
+_pending_buys: dict[str, str] = {}
 
 
 def _is_admin(update) -> bool:
@@ -142,7 +144,14 @@ async def scanner_loop():
                             f"💧 Liq: ${token.get('liquidity', 0):,.0f}\n"
                             "━━━━━━━━━━━━━━━━━━━━━━"
                         )
-                        await notifier.broadcast_alert(alert_msg)
+                        tp = token.get("contract_address", "")[:16]
+                        alert_markup = InlineKeyboardMarkup([
+                            [
+                                InlineKeyboardButton("🛒 Quick Buy 0.1 SOL", callback_data=f"quickbuy:{tp}:0.1"),
+                                InlineKeyboardButton("🛒 Quick Buy 0.5 SOL", callback_data=f"quickbuy:{tp}:0.5"),
+                            ]
+                        ])
+                        await notifier.broadcast_alert(alert_msg, reply_markup=alert_markup)
 
                         trading_users = await db.get_all_trading_users()
                         if not trading_users:
@@ -261,7 +270,25 @@ async def cmd_help(update, context):
         lines.append(f"Your user ID: <code>{uid}</code>")
         lines.append(f"Ask the admin to run: <code>/adduser {uid}</code>")
 
-    await update.message.reply_html("\n".join(lines))
+    if is_auth:
+        keyboard = [
+            [
+                InlineKeyboardButton("📊 Status", callback_data="status_refresh"),
+                InlineKeyboardButton("💰 Balance", callback_data="balance_refresh"),
+                InlineKeyboardButton("👛 Wallet", callback_data="wallet_refresh"),
+            ],
+            [
+                InlineKeyboardButton("📜 History", callback_data="history_page:0"),
+                InlineKeyboardButton("💼 Portfolio", callback_data="portfolio_refresh"),
+                InlineKeyboardButton("⚙️ Config", callback_data="config_show"),
+            ],
+        ]
+        await update.message.reply_html(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    else:
+        await update.message.reply_html("\n".join(lines))
 
 
 async def cmd_start(update, context):
@@ -350,13 +377,27 @@ async def cmd_wallet(update, context):
     ut = await create_user_trader(user_id)
     balance = await ut.get_balance() if ut else 0.0
     auto_trade = "✅ Enabled" if wallet_data.get("auto_trade", 1) else "❌ Disabled"
+    at_state = "off" if wallet_data.get("auto_trade", 1) else "on"
+    at_label = "⚙️ AutoTrade Off" if wallet_data.get("auto_trade", 1) else "⚙️ AutoTrade On"
+
+    keyboard = [
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="wallet_refresh"),
+            InlineKeyboardButton(at_label, callback_data=f"autotrade:{at_state}"),
+        ],
+        [
+            InlineKeyboardButton("💸 Withdraw Instructions", callback_data="withdraw_prompt"),
+            InlineKeyboardButton("🔑 Export (DM only)", callback_data="export_prompt"),
+        ],
+    ]
 
     await update.message.reply_html(
         f"👛 <b>Your Wallet</b>\n"
         f"Address: <code>{wallet_data['public_key']}</code>\n"
         f"Balance: {balance:.6f} {native}\n"
         f"Auto-Trade: {auto_trade}\n\n"
-        f"Send {native} to the address above to fund your trading wallet."
+        f"Send {native} to the address above to fund your trading wallet.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
@@ -546,6 +587,7 @@ async def cmd_status(update, context):
                 )
     else:
         lines = ["📊 <b>Open Positions</b>\n"]
+        keyboard = []
         for p in positions:
             roi = p.get("roi", 0)
             arrow = "🟢" if roi >= 0 else "🔴"
@@ -557,8 +599,18 @@ async def cmd_status(update, context):
             )
             if p.get("trailing_activated"):
                 lines.append(f"   📈 Trailing active | Peak: {p.get('peak_price', 0):.10f} {native}")
+            tp = p["token_address"][:16]
+            keyboard.append([
+                InlineKeyboardButton(f"💰 Sell 25% {p['token_symbol']}", callback_data=f"sell:{tp}:25"),
+                InlineKeyboardButton(f"💰 Sell 50%", callback_data=f"sell:{tp}:50"),
+                InlineKeyboardButton(f"💰 Sell 100%", callback_data=f"sell:{tp}:100"),
+            ])
+        keyboard.append([InlineKeyboardButton("🔄 Refresh Positions", callback_data="status_refresh")])
 
-    await update.message.reply_html("\n".join(lines))
+    await update.message.reply_html(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(keyboard) if not show_all else None,
+    )
 
 
 async def cmd_balance(update, context):
@@ -574,7 +626,16 @@ async def cmd_balance(update, context):
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
     balance = await ut.get_balance()
-    await update.message.reply_html(f"💰 <b>Wallet Balance</b>\n{balance:.6f} {native} ({CHAIN})")
+    keyboard = [
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="balance_refresh"),
+            InlineKeyboardButton("👛 Wallet Details", callback_data="wallet_refresh"),
+        ]
+    ]
+    await update.message.reply_html(
+        f"💰 <b>Wallet Balance</b>\n{balance:.6f} {native} ({CHAIN})",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
 async def cmd_history(update, context):
@@ -583,14 +644,19 @@ async def cmd_history(update, context):
         return
 
     user_id = update.effective_user.id
-    trades = await db.get_trade_history(limit=10, user_id=user_id)
+    all_trades = await db.get_trade_history(limit=100, user_id=user_id)
 
-    if not trades:
+    if not all_trades:
         await update.message.reply_text("No completed trades.")
         return
 
+    page_size = 5
+    total = len(all_trades)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    trades = all_trades[:page_size]
+
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
-    lines = ["📜 <b>Trade History</b> (last 10)\n"]
+    lines = [f"📜 <b>Trade History</b> (page 1/{total_pages})\n"]
     for t in trades:
         roi = t.get("roi_percent", 0)
         arrow = "🟢" if roi >= 0 else "🔴"
@@ -601,7 +667,18 @@ async def cmd_history(update, context):
             f"   Duration: {dur}\n"
         )
 
-    await update.message.reply_html("\n".join(lines))
+    keyboard_row = []
+    keyboard_row.append(InlineKeyboardButton("⬅️ Prev", callback_data="noop"))
+    keyboard_row.append(InlineKeyboardButton(f"Page 1/{total_pages}", callback_data="noop"))
+    if total_pages > 1:
+        keyboard_row.append(InlineKeyboardButton("➡️ Next", callback_data=f"history_page:{page_size}"))
+    else:
+        keyboard_row.append(InlineKeyboardButton("➡️ Next", callback_data="noop"))
+
+    await update.message.reply_html(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup([keyboard_row]),
+    )
 
 
 async def cmd_config(update, context):
@@ -690,60 +767,22 @@ async def cmd_buy(update, context):
         logger.warning("Manual buy blocked — honeypot: %s", token_address)
         return
 
+    tp = token_address[:16]
+    _pending_buys[f"{user_id}:{tp}"] = token_address
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Confirm Buy", callback_data=f"buy_confirm:{tp}:{buy_amount}"),
+            InlineKeyboardButton("❌ Cancel", callback_data="buy_cancel"),
+        ]
+    ]
+
     await update.message.reply_html(
-        f"\U0001f504 <b>Manual Buy</b>\n"
+        f"⚙️ <b>Manual Buy</b>\n"
         f"Token: <code>{token_address}</code>\n"
-        f"Amount: {buy_amount:.4f} {native}\n"
-        f"Executing..."
+        f"Amount: {buy_amount:.4f} {native}\n\n"
+        f"Confirm or cancel below.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
-
-    result = await user_trader.buy_token(token_address, buy_amount)
-
-    if result is None:
-        await update.message.reply_html("\u274c <b>Buy failed.</b> Check logs for details.")
-        logger.error("Manual buy failed for %s (user %d)", token_address, user_id)
-        return
-
-    symbol = token_address[:8]
-
-    entry_liq = 0.0
-    try:
-        from dexscreener import get_token_liquidity
-        async with aiohttp.ClientSession() as liq_session:
-            entry_liq = await get_token_liquidity(liq_session, CHAIN, token_address)
-    except Exception:
-        pass
-
-    position = {
-        "token_address": token_address,
-        "token_symbol": result.get("symbol", symbol),
-        "chain": CHAIN.upper(),
-        "entry_price": result["entry_price"],
-        "tokens_received": result["tokens_received"],
-        "buy_amount_native": result["amount_spent"],
-        "buy_tx_hash": result["tx_hash"],
-        "pair_address": "",
-        "entry_liquidity": entry_liq,
-        "user_id": user_id,
-    }
-    await db.save_open_position(position)
-
-    await notifier.notify_buy_executed(
-        symbol=symbol,
-        tokens_received=result["tokens_received"],
-        entry_price=result["entry_price"],
-        tx_hash=result["tx_hash"],
-        chain=CHAIN.upper(),
-        chat_id=user_id,
-    )
-
-    if not _is_admin(update):
-        await notifier.send_message(
-            f"📋 User <code>{user_id}</code> manual buy {symbol} — "
-            f"{result['amount_spent']:.4f} {native}",
-        )
-
-    logger.info("Manual buy executed: %s, user=%d, tx=%s", token_address, user_id, result["tx_hash"])
 
 
 async def cmd_sell(update, context):
@@ -1039,7 +1078,11 @@ async def cmd_portfolio(update, context):
         msg_parts.append("")
         msg_parts.append("No open positions.")
 
-    await update.message.reply_html("\n".join(msg_parts))
+    keyboard = [[InlineKeyboardButton("🔄 Refresh Portfolio", callback_data="portfolio_refresh")]]
+    await update.message.reply_html(
+        "\n".join(msg_parts),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
 async def cmd_adduser(update, context):
@@ -1366,6 +1409,700 @@ async def shutdown(application):
     logger.info("Shutdown complete")
 
 
+# ---------------------------------------------------------------------------
+# Inline-keyboard callback handler + sub-handlers
+# ---------------------------------------------------------------------------
+
+async def _handle_sell_callback(query, user_id, token_prefix, percent):
+    positions = await db.get_open_positions(user_id=user_id)
+    pos = None
+    for p in positions:
+        if p["token_address"][:16] == token_prefix:
+            pos = p
+            break
+    if pos is None:
+        await query.edit_message_text("Position not found or already closed.")
+        return
+
+    token_address = pos["token_address"]
+    user_trader = await create_user_trader(user_id)
+    if user_trader is None:
+        await query.edit_message_text("No wallet found.")
+        return
+
+    ui_balance, decimals = await user_trader.get_token_balance(token_address)
+    if ui_balance <= 0:
+        await query.edit_message_text("Zero token balance.")
+        return
+
+    sell_fraction = percent / 100.0
+    sell_ui = ui_balance * sell_fraction
+    sell_raw = int(sell_ui * (10 ** decimals)) if decimals > 0 else int(sell_ui * 1e9)
+
+    if sell_raw <= 0:
+        await query.edit_message_text("Amount too small to sell.")
+        return
+
+    await query.edit_message_text(f"🔄 Selling {percent}% of {pos['token_symbol']}...")
+
+    result = await user_trader.sell_token(token_address, sell_raw, decimals)
+    if result is None:
+        await query.edit_message_text(f"❌ Sell failed for {pos['token_symbol']}.")
+        return
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+
+    if percent == 100:
+        entry_price = pos["entry_price"]
+        roi = ((result["exit_price"] - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+
+        opened_at = pos.get("opened_at", "")
+        duration_seconds = 0
+        if opened_at:
+            try:
+                if isinstance(opened_at, str):
+                    ot = datetime.fromisoformat(opened_at).replace(tzinfo=timezone.utc)
+                else:
+                    ot = opened_at
+                duration_seconds = int((datetime.now(timezone.utc) - ot).total_seconds())
+            except Exception:
+                pass
+
+        exit_data = {
+            "exit_price": result["exit_price"],
+            "sell_amount_native": result["native_received"],
+            "profit_usd": None,
+            "roi_percent": roi,
+            "sell_tx_hash": result["tx_hash"],
+            "duration_seconds": duration_seconds,
+        }
+        await db.close_position(pos["token_address"], CHAIN.upper(), exit_data, user_id=user_id)
+
+        try:
+            profit_native = result["native_received"] - pos["buy_amount_native"]
+            if profit_native > 0:
+                admin_wallet_data = await db.get_user_wallet(TELEGRAM_CHAT_ID)
+                if admin_wallet_data:
+                    fee_result = await collect_fee(
+                        user_id=user_id,
+                        token_symbol=pos["token_symbol"],
+                        profit_native=profit_native,
+                        admin_public_key=admin_wallet_data["public_key"],
+                    )
+                    if fee_result and fee_result.get("tx_hash"):
+                        await notifier.send_message(
+                            f"💰 Fee collected: {fee_result['fee_amount']:.6f} SOL from user {user_id} "
+                            f"({fee_result['fee_pct']:.1f}% of {profit_native:.6f} SOL profit on {pos['token_symbol']})"
+                        )
+        except Exception as fee_exc:
+            logger.error("Fee collection failed during inline sell: %s", fee_exc)
+
+    tx_url = EXPLORER_TX.get(CHAIN.upper(), EXPLORER_TX["SOL"]).format(result["tx_hash"])
+    short_hash = result["tx_hash"][:10] + "…" + result["tx_hash"][-6:] if len(result["tx_hash"]) > 20 else result["tx_hash"]
+    await query.edit_message_text(
+        f"✅ Sold {percent}% of {pos['token_symbol']}\n"
+        f"Received: {result['native_received']:.6f} {native}\n"
+        f'TX: <a href="{tx_url}">{short_hash}</a>',
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+    await notifier.send_message(
+        f"📋 User <code>{user_id}</code> inline sell {pos['token_symbol']} ({percent}%) — "
+        f"received {result['native_received']:.4f} {native}",
+    )
+    logger.info("Inline sell: %s (%d%%), user=%d, tx=%s", token_address, percent, user_id, result["tx_hash"])
+
+
+async def _handle_buy_confirm_callback(query, user_id, token_prefix, amount):
+    cache_key = f"{user_id}:{token_prefix}"
+    token_address = _pending_buys.pop(cache_key, None)
+
+    if token_address is None:
+        import aiosqlite
+        from db import DB_PATH
+        async with aiosqlite.connect(str(DB_PATH)) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT contract_address FROM detected_tokens WHERE contract_address LIKE ? ORDER BY detected_at DESC LIMIT 1",
+                (token_prefix + "%",),
+            )
+            row = await cur.fetchone()
+            if row:
+                token_address = row["contract_address"]
+    if token_address is None:
+        positions = await db.get_open_positions(user_id=user_id)
+        for p in positions:
+            if p["token_address"][:16] == token_prefix:
+                token_address = p["token_address"]
+                break
+
+    if token_address is None:
+        await query.edit_message_text("Token not found. Please use /buy with the full address.")
+        return
+
+    user_trader = await create_user_trader(user_id)
+    if user_trader is None:
+        await query.edit_message_text("No wallet found.")
+        return
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    await query.edit_message_text(
+        f"🔄 Executing buy of {amount:.4f} {native}...",
+    )
+
+    result = await user_trader.buy_token(token_address, amount)
+    if result is None:
+        await query.edit_message_text("❌ Buy failed. Check logs for details.")
+        logger.error("Inline buy failed for %s (user %d)", token_address, user_id)
+        return
+
+    symbol = result.get("symbol", token_address[:8])
+
+    entry_liq = 0.0
+    try:
+        from dexscreener import get_token_liquidity
+        async with aiohttp.ClientSession() as liq_session:
+            entry_liq = await get_token_liquidity(liq_session, CHAIN, token_address)
+    except Exception:
+        pass
+
+    position = {
+        "token_address": token_address,
+        "token_symbol": symbol,
+        "chain": CHAIN.upper(),
+        "entry_price": result["entry_price"],
+        "tokens_received": result["tokens_received"],
+        "buy_amount_native": result["amount_spent"],
+        "buy_tx_hash": result["tx_hash"],
+        "pair_address": "",
+        "entry_liquidity": entry_liq,
+        "user_id": user_id,
+    }
+    await db.save_open_position(position)
+
+    tx_url = EXPLORER_TX.get(CHAIN.upper(), EXPLORER_TX["SOL"]).format(result["tx_hash"])
+    short_hash = result["tx_hash"][:10] + "…" + result["tx_hash"][-6:] if len(result["tx_hash"]) > 20 else result["tx_hash"]
+    await query.edit_message_text(
+        f"✅ <b>Buy Executed</b>\n"
+        f"Token: {symbol} | Amount: {result['tokens_received']:.4f}\n"
+        f"Entry Price: {result['entry_price']:.10f}\n"
+        f'TX: <a href="{tx_url}">{short_hash}</a>',
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+    is_admin_user = user_id == TELEGRAM_CHAT_ID
+    if not is_admin_user:
+        await notifier.send_message(
+            f"📋 User <code>{user_id}</code> inline buy {symbol} — "
+            f"{result['amount_spent']:.4f} {native}",
+        )
+    logger.info("Inline buy: %s, user=%d, tx=%s", token_address, user_id, result["tx_hash"])
+
+
+async def _handle_quickbuy_callback(query, user_id, token_prefix, amount):
+    is_allowed = user_id == TELEGRAM_CHAT_ID or await db.is_user_allowed(user_id)
+    if not is_allowed:
+        await query.answer("⛔ Not authorized.", show_alert=True)
+        return
+
+    import aiosqlite
+    from db import DB_PATH
+    token_address = None
+    symbol = "?"
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT contract_address, symbol FROM detected_tokens WHERE contract_address LIKE ? ORDER BY detected_at DESC LIMIT 1",
+            (token_prefix + "%",),
+        )
+        row = await cur.fetchone()
+        if row:
+            token_address = row["contract_address"]
+            symbol = row["symbol"] or "?"
+
+    if token_address is None:
+        await query.answer("Token no longer available.", show_alert=True)
+        return
+
+    already = await db.is_token_already_bought(token_address, CHAIN.upper(), user_id)
+    if already:
+        await query.answer("Already holding this token.", show_alert=True)
+        return
+
+    user_trader = await create_user_trader(user_id)
+    if user_trader is None:
+        await query.answer("No wallet found.", show_alert=True)
+        return
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    await query.answer(f"Buying {amount} {native} of {symbol}...")
+
+    result = await user_trader.buy_token(token_address, amount)
+    if result is None:
+        await notifier.send_to_user(user_id, f"❌ Quick buy failed for {symbol}")
+        return
+
+    entry_liq = 0.0
+    try:
+        from dexscreener import get_token_liquidity
+        async with aiohttp.ClientSession() as liq_session:
+            entry_liq = await get_token_liquidity(liq_session, CHAIN, token_address)
+    except Exception:
+        pass
+
+    position = {
+        "token_address": token_address,
+        "token_symbol": symbol,
+        "chain": CHAIN.upper(),
+        "entry_price": result["entry_price"],
+        "tokens_received": result["tokens_received"],
+        "buy_amount_native": result["amount_spent"],
+        "buy_tx_hash": result["tx_hash"],
+        "pair_address": "",
+        "entry_liquidity": entry_liq,
+        "user_id": user_id,
+    }
+    await db.save_open_position(position)
+
+    await notifier.notify_buy_executed(
+        symbol=symbol,
+        tokens_received=result["tokens_received"],
+        entry_price=result["entry_price"],
+        tx_hash=result["tx_hash"],
+        chain=CHAIN.upper(),
+        chat_id=user_id,
+    )
+    await notifier.send_message(
+        f"📋 User <code>{user_id}</code> quick buy {symbol} — "
+        f"{result['amount_spent']:.4f} {native}",
+    )
+    logger.info("Quick buy: %s, user=%d, tx=%s", token_address, user_id, result["tx_hash"])
+
+
+async def _handle_status_refresh(query, user_id):
+    positions = await monitor.get_positions_with_roi(user_id=user_id)
+    if not positions:
+        await query.edit_message_text("No open positions.")
+        return
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    lines = ["📊 <b>Open Positions</b>\n"]
+    keyboard = []
+    for p in positions:
+        roi = p.get("roi", 0)
+        arrow = "🟢" if roi >= 0 else "🔴"
+        lines.append(
+            f"{arrow} <b>{p['token_symbol']}</b> | ROI: {roi:+.2f}%\n"
+            f"   Entry: {p['entry_price']:.10f} {native}\n"
+            f"   Current: {p.get('current_price', 0):.10f} {native}\n"
+            f"   Amount: {p['tokens_received']:.4f} | Spent: {p['buy_amount_native']:.4f} {native}\n"
+        )
+        if p.get("trailing_activated"):
+            lines.append(f"   📈 Trailing active | Peak: {p.get('peak_price', 0):.10f} {native}")
+        tp = p["token_address"][:16]
+        keyboard.append([
+            InlineKeyboardButton(f"💰 Sell 25% {p['token_symbol']}", callback_data=f"sell:{tp}:25"),
+            InlineKeyboardButton(f"💰 Sell 50%", callback_data=f"sell:{tp}:50"),
+            InlineKeyboardButton(f"💰 Sell 100%", callback_data=f"sell:{tp}:100"),
+        ])
+    keyboard.append([InlineKeyboardButton("🔄 Refresh Positions", callback_data="status_refresh")])
+
+    await query.edit_message_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def _handle_wallet_refresh(query, user_id):
+    wallet_data = await db.get_user_wallet(user_id)
+    if not wallet_data:
+        await query.edit_message_text("No wallet found.")
+        return
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    ut = await create_user_trader(user_id)
+    balance = await ut.get_balance() if ut else 0.0
+    auto_trade = "✅ Enabled" if wallet_data.get("auto_trade", 1) else "❌ Disabled"
+    at_state = "off" if wallet_data.get("auto_trade", 1) else "on"
+    at_label = "⚙️ AutoTrade Off" if wallet_data.get("auto_trade", 1) else "⚙️ AutoTrade On"
+
+    keyboard = [
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="wallet_refresh"),
+            InlineKeyboardButton(at_label, callback_data=f"autotrade:{at_state}"),
+        ],
+        [
+            InlineKeyboardButton("💸 Withdraw Instructions", callback_data="withdraw_prompt"),
+            InlineKeyboardButton("🔑 Export (DM only)", callback_data="export_prompt"),
+        ],
+    ]
+
+    await query.edit_message_text(
+        f"👛 <b>Your Wallet</b>\n"
+        f"Address: <code>{wallet_data['public_key']}</code>\n"
+        f"Balance: {balance:.6f} {native}\n"
+        f"Auto-Trade: {auto_trade}\n\n"
+        f"Send {native} to the address above to fund your trading wallet.",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def _handle_balance_refresh(query, user_id):
+    ut = await create_user_trader(user_id)
+    if ut is None:
+        await query.edit_message_text("No wallet found.")
+        return
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    balance = await ut.get_balance()
+    keyboard = [
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="balance_refresh"),
+            InlineKeyboardButton("👛 Wallet Details", callback_data="wallet_refresh"),
+        ]
+    ]
+    await query.edit_message_text(
+        f"💰 <b>Wallet Balance</b>\n{balance:.6f} {native} ({CHAIN})",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def _handle_portfolio_refresh(query, user_id):
+    ut = await create_user_trader(user_id)
+    if ut is None:
+        await query.edit_message_text("No wallet found.")
+        return
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    wallet_balance = await ut.get_balance()
+    positions = await monitor.get_positions_with_roi(user_id=user_id)
+
+    total_invested = 0.0
+    total_current_value = 0.0
+    position_lines = []
+    for p in positions:
+        invested = p.get("buy_amount_native", 0)
+        tokens = p.get("tokens_received", 0)
+        current = p.get("current_price", 0)
+        roi = p.get("roi", 0)
+        symbol = p.get("token_symbol", "???")
+        total_invested += invested
+        if current > 0:
+            current_value = current * tokens
+            price_ok = True
+        else:
+            current_value = invested
+            price_ok = False
+        total_current_value += current_value
+        pnl = current_value - invested
+        pnl_sign = "+" if pnl >= 0 else ""
+        if not price_ok:
+            arrow = "⚠️"
+        elif roi >= 0:
+            arrow = "🟢"
+        else:
+            arrow = "🔴"
+        line = (
+            f"{arrow} <b>{symbol}</b>\n"
+            f"   Invested: {invested:.4f} {native}\n"
+            f"   Value: {current_value:.4f} {native} ({pnl_sign}{pnl:.4f})\n"
+            f"   ROI: {roi:+.2f}%"
+        )
+        if not price_ok:
+            line += " ⚠️ price unavailable"
+        position_lines.append(line)
+
+    trades = await db.get_trade_history(limit=100, user_id=user_id)
+    realized_pnl = 0.0
+    total_trades = len(trades)
+    winning_trades = 0
+    for t in trades:
+        buy_native = t.get("buy_amount_native", 0)
+        sell_native = t.get("sell_amount_native", 0)
+        realized_pnl += (sell_native - buy_native)
+        if t.get("roi_percent", 0) > 0:
+            winning_trades += 1
+    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+    unrealized_pnl = total_current_value - total_invested
+    overall_pnl = unrealized_pnl + realized_pnl
+    overall_sign = "+" if overall_pnl >= 0 else ""
+    unrealized_sign = "+" if unrealized_pnl >= 0 else ""
+    realized_sign = "+" if realized_pnl >= 0 else ""
+    total_portfolio = wallet_balance + total_current_value
+
+    msg_parts = [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "💼 <b>PORTFOLIO OVERVIEW</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"💰 Wallet: {wallet_balance:.4f} {native}",
+        f"📦 In Positions: {total_current_value:.4f} {native}",
+        f"📊 Total Value: {total_portfolio:.4f} {native}",
+        "",
+        "<b>PnL Summary</b>",
+        f"   Unrealized: {unrealized_sign}{unrealized_pnl:.4f} {native}",
+        f"   Realized: {realized_sign}{realized_pnl:.4f} {native}",
+        f"   Overall: {overall_sign}{overall_pnl:.4f} {native}",
+        "",
+        "<b>Stats</b>",
+        f"   Open Positions: {len(positions)}",
+        f"   Completed Trades: {total_trades}",
+        f"   Win Rate: {win_rate:.1f}%",
+    ]
+    if position_lines:
+        msg_parts.append("")
+        msg_parts.append("━━━━━━━━━━━━━━━━━━━━━━")
+        msg_parts.append("📋 <b>OPEN POSITIONS</b>")
+        msg_parts.append("━━━━━━━━━━━━━━━━━━━━━━")
+        for line in position_lines:
+            msg_parts.append(line)
+    else:
+        msg_parts.append("")
+        msg_parts.append("No open positions.")
+
+    keyboard = [[InlineKeyboardButton("🔄 Refresh Portfolio", callback_data="portfolio_refresh")]]
+    await query.edit_message_text(
+        "\n".join(msg_parts),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def _handle_history_page(query, user_id, offset):
+    all_trades = await db.get_trade_history(limit=100, user_id=user_id)
+    if not all_trades:
+        await query.edit_message_text("No completed trades.")
+        return
+
+    page_size = 5
+    total = len(all_trades)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    current_page = offset // page_size + 1
+    trades = all_trades[offset: offset + page_size]
+
+    if not trades:
+        await query.answer("No more trades.")
+        return
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    lines = [f"📜 <b>Trade History</b> (page {current_page}/{total_pages})\n"]
+    for t in trades:
+        roi = t.get("roi_percent", 0)
+        arrow = "🟢" if roi >= 0 else "🔴"
+        dur = _format_duration(t.get("duration_seconds", 0))
+        lines.append(
+            f"{arrow} <b>{t['token_symbol']}</b> | ROI: {roi:+.2f}%\n"
+            f"   Buy: {t['buy_amount_native']:.4f} → Sell: {t['sell_amount_native']:.4f} {native}\n"
+            f"   Duration: {dur}\n"
+        )
+
+    keyboard_row = []
+    if offset > 0:
+        keyboard_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"history_page:{offset - page_size}"))
+    else:
+        keyboard_row.append(InlineKeyboardButton("⬅️ Prev", callback_data="noop"))
+    keyboard_row.append(InlineKeyboardButton(f"Page {current_page}/{total_pages}", callback_data="noop"))
+    if offset + page_size < total:
+        keyboard_row.append(InlineKeyboardButton("➡️ Next", callback_data=f"history_page:{offset + page_size}"))
+    else:
+        keyboard_row.append(InlineKeyboardButton("➡️ Next", callback_data="noop"))
+
+    await query.edit_message_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup([keyboard_row]),
+    )
+
+
+async def _handle_autotrade_callback(query, user_id, state):
+    wallet_data = await db.get_user_wallet(user_id)
+    if not wallet_data:
+        await query.edit_message_text("No wallet found.")
+        return
+
+    enable = state == "on"
+    await db.set_auto_trade(user_id, enable)
+    label = "enabled" if enable else "paused"
+    icon = "✅" if enable else "❌"
+    await query.answer(f"{icon} Auto-trading {label}.")
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    ut = await create_user_trader(user_id)
+    balance = await ut.get_balance() if ut else 0.0
+    auto_trade = "✅ Enabled" if enable else "❌ Disabled"
+    at_state = "off" if enable else "on"
+    at_label = "⚙️ AutoTrade Off" if enable else "⚙️ AutoTrade On"
+
+    keyboard = [
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="wallet_refresh"),
+            InlineKeyboardButton(at_label, callback_data=f"autotrade:{at_state}"),
+        ],
+        [
+            InlineKeyboardButton("💸 Withdraw Instructions", callback_data="withdraw_prompt"),
+            InlineKeyboardButton("🔑 Export (DM only)", callback_data="export_prompt"),
+        ],
+    ]
+
+    await query.edit_message_text(
+        f"👛 <b>Your Wallet</b>\n"
+        f"Address: <code>{wallet_data['public_key']}</code>\n"
+        f"Balance: {balance:.6f} {native}\n"
+        f"Auto-Trade: {auto_trade}\n\n"
+        f"Send {native} to the address above to fund your trading wallet.",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def handle_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data or ""
+    user_id = update.effective_user.id
+
+    is_allowed = user_id == TELEGRAM_CHAT_ID or await db.is_user_allowed(user_id)
+    if not is_allowed:
+        await query.answer("⛔ Not authorized.", show_alert=True)
+        return
+
+    try:
+        if data == "noop":
+            return
+
+        elif data == "status_refresh":
+            await _handle_status_refresh(query, user_id)
+
+        elif data.startswith("sell:"):
+            parts = data.split(":")
+            if len(parts) == 3:
+                token_prefix = parts[1]
+                percent = int(parts[2])
+                await _handle_sell_callback(query, user_id, token_prefix, percent)
+
+        elif data.startswith("buy_confirm:"):
+            parts = data.split(":")
+            if len(parts) == 3:
+                token_prefix = parts[1]
+                amount = float(parts[2])
+                await _handle_buy_confirm_callback(query, user_id, token_prefix, amount)
+
+        elif data == "buy_cancel":
+            await query.edit_message_text("Buy cancelled.")
+
+        elif data == "wallet_refresh":
+            await _handle_wallet_refresh(query, user_id)
+
+        elif data.startswith("autotrade:"):
+            state = data.split(":")[1]
+            await _handle_autotrade_callback(query, user_id, state)
+
+        elif data == "withdraw_prompt":
+            await query.edit_message_text(
+                "💸 <b>Withdraw Instructions</b>\n\n"
+                "Use: <code>/withdraw &lt;amount&gt; &lt;destination_address&gt;</code>\n"
+                "Example: <code>/withdraw 0.5 ABC...XYZ</code>",
+                parse_mode="HTML",
+            )
+
+        elif data == "export_prompt":
+            await query.answer("Please DM me /export for security", show_alert=True)
+
+        elif data == "portfolio_refresh":
+            await _handle_portfolio_refresh(query, user_id)
+
+        elif data.startswith("history_page:"):
+            offset = int(data.split(":")[1])
+            await _handle_history_page(query, user_id, offset)
+
+        elif data == "balance_refresh":
+            await _handle_balance_refresh(query, user_id)
+
+        elif data.startswith("pos_detail:"):
+            token_prefix = data.split(":")[1]
+            positions = await monitor.get_positions_with_roi(user_id=user_id)
+            pos = None
+            for p in positions:
+                if p["token_address"][:16] == token_prefix:
+                    pos = p
+                    break
+            if pos is None:
+                await query.edit_message_text("Position not found.")
+                return
+            native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+            roi = pos.get("roi", 0)
+            arrow = "🟢" if roi >= 0 else "🔴"
+            tp = pos["token_address"][:16]
+            keyboard = [
+                [
+                    InlineKeyboardButton("💰 Sell 25%", callback_data=f"sell:{tp}:25"),
+                    InlineKeyboardButton("💰 Sell 50%", callback_data=f"sell:{tp}:50"),
+                    InlineKeyboardButton("💰 Sell 100%", callback_data=f"sell:{tp}:100"),
+                ],
+                [InlineKeyboardButton("🔙 Back to Positions", callback_data="status_refresh")],
+            ]
+            await query.edit_message_text(
+                f"{arrow} <b>{pos['token_symbol']}</b>\n"
+                f"Address: <code>{pos['token_address']}</code>\n"
+                f"ROI: {roi:+.2f}%\n"
+                f"Entry: {pos['entry_price']:.10f} {native}\n"
+                f"Current: {pos.get('current_price', 0):.10f} {native}\n"
+                f"Tokens: {pos['tokens_received']:.4f}\n"
+                f"Invested: {pos['buy_amount_native']:.4f} {native}",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+
+        elif data.startswith("quickbuy:"):
+            parts = data.split(":")
+            if len(parts) == 3:
+                token_prefix = parts[1]
+                amount = float(parts[2])
+                await _handle_quickbuy_callback(query, user_id, token_prefix, amount)
+
+        elif data == "config_show":
+            msg = (
+                "⚙️ <b>Configuration</b>\n\n"
+                f"Chain: {CHAIN}\n"
+                f"Scanner Mode: {'DexTools + DexScreener' if DEXTOOLS_API_KEY else 'DexScreener only'}\n"
+                f"Buy Percent: {BUY_PERCENT}%\n"
+                f"Take Profit: {TAKE_PROFIT}%\n"
+                f"Stop Loss: {STOP_LOSS}%\n"
+                f"Trailing TP: {'Enabled' if TRAILING_ENABLED else 'Disabled'}\n"
+                f"Trailing Drop: {TRAILING_DROP}%\n"
+                f"Slippage: {SLIPPAGE}%\n"
+                f"Min Liquidity: ${MIN_LIQUIDITY:,}\n"
+                f"Market Cap Range: ${MIN_MCAP:,} – ${MAX_MCAP:,}\n"
+                f"Min Safety Score: {MIN_SCORE}/100\n"
+                f"Scan Interval: {SCAN_INTERVAL}s\n"
+                f"Monitor Interval: {MONITOR_INTERVAL}s"
+            )
+            await query.edit_message_text(msg, parse_mode="HTML")
+
+        else:
+            logger.warning("Unknown callback data: %s", data)
+
+    except Exception as exc:
+        logger.error("Callback error (data=%s, user=%d): %s", data, user_id, exc)
+        try:
+            await query.edit_message_text(f"❌ Error: {str(exc)[:200]}")
+        except Exception:
+            pass
+
+
 def main():
     logger.info("Starting DexTool Scanner Bot …")
 
@@ -1399,6 +2136,7 @@ def main():
     app.add_handler(CommandHandler("removewhale", cmd_removewhale))
     app.add_handler(CommandHandler("whales", cmd_whales))
     app.add_handler(CommandHandler("fees", cmd_fees))
+    app.add_handler(CallbackQueryHandler(handle_callback))
 
     def _handle_signal(signum, frame):
         logger.info("Received signal %s – shutting down", signum)

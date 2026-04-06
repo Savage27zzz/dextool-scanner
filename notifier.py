@@ -13,37 +13,43 @@ class Notifier:
         self.bot = Bot(token=bot_token)
         self.chat_id = chat_id
 
-    async def send_message(self, text: str, chat_id: int | None = None):
+    async def send_message(self, text: str, chat_id: int | None = None, reply_markup=None):
         target = chat_id if chat_id is not None else self.chat_id
         try:
             chunks = _split_message(text)
-            for chunk in chunks:
-                await self.bot.send_message(
-                    chat_id=target,
-                    text=chunk,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
+            for i, chunk in enumerate(chunks):
+                kwargs = {
+                    "chat_id": target,
+                    "text": chunk,
+                    "parse_mode": ParseMode.HTML,
+                    "disable_web_page_preview": True,
+                }
+                if reply_markup and i == len(chunks) - 1:
+                    kwargs["reply_markup"] = reply_markup
+                await self.bot.send_message(**kwargs)
         except Exception as exc:
             logger.error("Failed to send Telegram message to %s: %s", target, exc)
 
-    async def send_to_user(self, user_id: int, text: str):
-        await self.send_message(text, chat_id=user_id)
+    async def send_to_user(self, user_id: int, text: str, reply_markup=None):
+        await self.send_message(text, chat_id=user_id, reply_markup=reply_markup)
 
-    async def broadcast_alert(self, text: str):
+    async def broadcast_alert(self, text: str, reply_markup=None):
         import db as _db
         chats = await _db.get_all_bot_chats()
         for chat in chats:
             cid = chat["chat_id"]
             try:
                 chunks = _split_message(text)
-                for chunk in chunks:
-                    await self.bot.send_message(
-                        chat_id=cid,
-                        text=chunk,
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
-                    )
+                for i, chunk in enumerate(chunks):
+                    kwargs = {
+                        "chat_id": cid,
+                        "text": chunk,
+                        "parse_mode": ParseMode.HTML,
+                        "disable_web_page_preview": True,
+                    }
+                    if reply_markup and i == len(chunks) - 1:
+                        kwargs["reply_markup"] = reply_markup
+                    await self.bot.send_message(**kwargs)
             except (Forbidden, BadRequest) as exc:
                 logger.warning("Removing unreachable chat %d: %s", cid, exc)
                 await _db.remove_bot_chat(cid)
