@@ -55,6 +55,9 @@ MIN_SCORE: int = _env("MIN_SCORE", default="40", cast=int)
 WHALE_TRACKING_ENABLED: bool = _env("WHALE_TRACKING_ENABLED", default="true", cast=lambda v: v.lower() in ("true", "1", "yes"))
 WHALE_CHECK_INTERVAL: int = _env("WHALE_CHECK_INTERVAL", default="45", cast=int)
 WHALE_MIN_SOL: float = _env("WHALE_MIN_SOL", default="1.0", cast=float)
+WHALE_COPY_ENABLED: bool = _env("WHALE_COPY_ENABLED", default="false", cast=lambda v: v.lower() in ("true", "1", "yes"))
+WHALE_COPY_AMOUNT: float = _env("WHALE_COPY_AMOUNT", default="0.1", cast=float)
+WHALE_COPY_MAX_PER_TOKEN: int = _env("WHALE_COPY_MAX_PER_TOKEN", default="1", cast=int)
 
 ANTIRUG_ENABLED: bool = _env("ANTIRUG_ENABLED", default="true", cast=lambda v: v.lower() in ("true", "1", "yes"))
 ANTIRUG_MIN_LIQ: int = _env("ANTIRUG_MIN_LIQ", default="1000", cast=int)
@@ -66,6 +69,36 @@ OPERATOR_FEE_ENABLED: bool = _env("OPERATOR_FEE_ENABLED", default="true", cast=l
 MAX_OPEN_POSITIONS: int = _env("MAX_OPEN_POSITIONS", default="5", cast=int)
 MAX_DAILY_LOSS: float = _env("MAX_DAILY_LOSS", default="2.0", cast=float)  # in native token (SOL/ETH/BNB)
 MAX_BUY_AMOUNT: float = _env("MAX_BUY_AMOUNT", default="1.0", cast=float)  # max per single buy in native token
+
+API_ENABLED: bool = _env("API_ENABLED", default="false", cast=lambda v: v.lower() in ("true", "1", "yes"))
+API_PORT: int = _env("API_PORT", default="8080", cast=int)
+API_KEY: str = _env("API_KEY", default="")
+
+SELL_TIERS_RAW: str = _env("SELL_TIERS", default="")
+
+
+def _parse_sell_tiers(raw: str) -> list[tuple[float, float]]:
+    """Parse 'ROI:PERCENT,ROI:PERCENT' into sorted list of (roi_threshold, sell_percent)."""
+    if not raw.strip():
+        return []
+    tiers = []
+    for part in raw.split(","):
+        part = part.strip()
+        if ":" not in part:
+            continue
+        roi_str, pct_str = part.split(":", 1)
+        try:
+            roi = float(roi_str)
+            pct = float(pct_str)
+            if 0 < pct <= 100 and roi > 0:
+                tiers.append((roi, pct))
+        except ValueError:
+            continue
+    tiers.sort(key=lambda t: t[0])
+    return tiers
+
+
+SELL_TIERS: list[tuple[float, float]] = _parse_sell_tiers(SELL_TIERS_RAW)
 
 DEXTOOLS_BASE_URL = f"https://public-api.dextools.io/{DEXTOOLS_PLAN}/v2"
 

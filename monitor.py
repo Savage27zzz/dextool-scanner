@@ -2,9 +2,10 @@ import asyncio
 from datetime import datetime, timezone
 
 import aiohttp
+import json
 
 import db
-from config import CHAIN, MONITOR_INTERVAL, NATIVE_SYMBOL, STOP_LOSS, TAKE_PROFIT, TRAILING_DROP, TRAILING_ENABLED, ANTIRUG_ENABLED, ANTIRUG_MIN_LIQ, ANTIRUG_LIQ_DROP_PCT, TELEGRAM_CHAT_ID, logger
+from config import CHAIN, MONITOR_INTERVAL, NATIVE_SYMBOL, STOP_LOSS, TAKE_PROFIT, TRAILING_DROP, TRAILING_ENABLED, ANTIRUG_ENABLED, ANTIRUG_MIN_LIQ, ANTIRUG_LIQ_DROP_PCT, TELEGRAM_CHAT_ID, SELL_TIERS, logger
 from fee_collector import collect_fee
 from dexscreener import get_token_liquidity
 from trader import create_user_trader, SolanaTrader
@@ -86,6 +87,59 @@ class ProfitMonitor:
         }
 
         await db.close_position(token_address, chain, exit_data, user_id=user_id)
+        sell_result["duration_seconds"] = duration_seconds
+        return sell_result
+
+    async def _execute_partial_sell(self, pos: dict, sell_fraction: float, roi: float, tier_label: str, user_trader: SolanaTrader | None = None, user_id: int = 0) -> dict | None:
+        """Sell a fraction (0.0-1.0) of a position. Returns sell_result or None."""
+        trader_to_use = user_trader or self.trader
+        token_address = pos["token_address"]
+        chain = pos["chain"]
+        symbol = pos["token_symbol"]
+
+        if chain.upper() == "SOL":
+            ui_balance, decimals = await trader_to_use.get_token_balance(token_address)
+            sell_ui = ui_balance * sell_fraction
+            tokens_raw = int(sell_ui * (10**decimals)) if decimals > 0 else int(sell_ui * 1e9)
+            if tokens_raw <= 0:
+                logger.warning("Zero partial balance for %s — skipping %s", symbol, tier_label)
+                return None
+            sell_result = await trader_to_use.sell_token(token_address, tokens_raw, decimals)
+        else:
+            ui_balance, decimals = await trader_to_use.get_token_balance(token_address, chain)
+            sell_ui = ui_balance * sell_fraction
+            tokens_raw = int(sell_ui * (10**decimals))
+            if tokens_raw <= 0:
+                logger.warning("Zero partial balance for %s — skipping %s", symbol, tier_label)
+                return None
+            sell_result = await trader_to_use.sell_token(token_address, chain, tokens_raw, decimals)
+
+        if sell_result is None:
+            logger.error("%s partial sell failed for %s", tier_label, symbol)
+            return None
+
+        opened_at = pos.get("opened_at", "")
+        duration_seconds = 0
+        if opened_at:
+            try:
+                if isinstance(opened_at, str):
+                    ot = datetime.fromisoformat(opened_at).replace(tzinfo=timezone.utc)
+                else:
+                    ot = opened_at
+                duration_seconds = int((datetime.now(timezone.utc) - ot).total_seconds())
+            except Exception:
+                pass
+
+        exit_data = {
+            "exit_price": sell_result["exit_price"],
+            "sell_amount_native": sell_result["native_received"],
+            "profit_usd": None,
+            "roi_percent": roi,
+            "sell_tx_hash": sell_result["tx_hash"],
+            "duration_seconds": duration_seconds,
+        }
+
+        await db.record_partial_sell(token_address, chain, user_id, sell_fraction, exit_data)
         sell_result["duration_seconds"] = duration_seconds
         return sell_result
 
@@ -211,6 +265,51 @@ class ProfitMonitor:
 
                 roi = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
                 logger.debug("%s ROI: %.2f%% (entry=%.10f, current=%.10f)", symbol, roi, entry_price, current_price)
+
+                # --- Tiered Sells ---
+                if SELL_TIERS:
+                    tiers_completed_raw = pos.get("tiers_completed", "[]")
+                    try:
+                        tiers_completed = json.loads(tiers_completed_raw) if isinstance(tiers_completed_raw, str) else []
+                    except (json.JSONDecodeError, TypeError):
+                        tiers_completed = []
+
+                    tiers_changed = False
+                    for tier_idx, (tier_roi, tier_pct) in enumerate(SELL_TIERS):
+                        if tier_idx in tiers_completed:
+                            continue
+                        if roi >= tier_roi:
+                            sell_fraction = tier_pct / 100.0
+                            tier_label = f"Tier-{tier_idx+1} ({tier_roi}%/{tier_pct}%)"
+                            logger.info("%s triggered for %s — ROI %.2f%%, selling %.0f%%", tier_label, symbol, roi, tier_pct)
+
+                            sell_result = await self._execute_partial_sell(
+                                pos, sell_fraction, roi, tier_label,
+                                user_trader=user_trader, user_id=user_id,
+                            )
+                            if sell_result:
+                                tiers_completed.append(tier_idx)
+                                tiers_changed = True
+                                native = NATIVE_SYMBOL.get(chain.upper(), "SOL")
+                                duration_str = _format_duration(sell_result["duration_seconds"])
+                                profit_native = sell_result["native_received"] - (pos["buy_amount_native"] * sell_fraction)
+
+                                await self.notifier.notify_tier_sell(
+                                    symbol=symbol,
+                                    tier_label=tier_label,
+                                    sell_percent=tier_pct,
+                                    roi=round(roi, 2),
+                                    native_received=sell_result["native_received"],
+                                    tx_hash=sell_result["tx_hash"],
+                                    chain=chain,
+                                    chat_id=notify_chat_id,
+                                )
+                                await self._admin_summary(user_id, f"{tier_label} sell", symbol, round(roi, 2), profit_native)
+                                if profit_native > 0:
+                                    await self._try_collect_fee(user_id, symbol, profit_native, notify_chat_id)
+
+                    if tiers_changed:
+                        await db.update_tiers_completed(token_address, chain, tiers_completed, user_id=user_id)
 
                 sold = False
 

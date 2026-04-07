@@ -188,6 +188,21 @@ class Notifier:
         )
         await self.send_message(msg, chat_id=chat_id)
 
+    async def notify_tier_sell(
+        self, symbol: str, tier_label: str, sell_percent: float, roi: float,
+        native_received: float, tx_hash: str, chain: str, chat_id: int | None = None,
+    ):
+        link = _tx_link(tx_hash, chain)
+        native = {"SOL": "SOL", "ETH": "ETH", "BSC": "BNB"}.get(chain.upper(), "SOL")
+        msg = (
+            f"\U0001f4ca <b>TIER SELL \u2014 {_esc(tier_label)}</b>\n"
+            f"Token: {_esc(symbol)} | Sold: {sell_percent:.0f}%\n"
+            f"ROI at sell: {roi:+.2f}%\n"
+            f"Received: {native_received:.6f} {native}\n"
+            f"TX: {link}"
+        )
+        await self.send_message(msg, chat_id=chat_id)
+
     async def notify_daily_loss_limit(self, user_id: int, daily_loss: float, limit: float, native: str):
         msg = (
             "⚠️ <b>DAILY LOSS LIMIT REACHED</b>\n"
@@ -231,6 +246,30 @@ class Notifier:
             f'TX: <a href="{solscan_url}">{short_tx}</a>\n'
             "━━━━━━━━━━━━━━━━━━━━━━"
         )
+        await self.send_message(msg)
+
+
+    async def notify_daily_report(self, stats: dict, native: str):
+        def _sign(v):
+            return f"+{v:.4f}" if v >= 0 else f"{v:.4f}"
+
+        msg = (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📅 <b>DAILY REPORT</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Trades: {stats['total_trades']} ({stats['winning_trades']}W / {stats['losing_trades']}L)\n"
+            f"Win Rate: {stats['win_rate']:.1f}%\n"
+            f"PnL: {_sign(stats['total_pnl_native'])} {native}\n"
+            f"Avg ROI: {stats['avg_roi']:+.2f}%\n"
+        )
+
+        if stats.get("best_trade"):
+            bt = stats["best_trade"]
+            msg += f"🏆 Best: {bt['token_symbol']} ({bt['roi_percent']:+.1f}%)\n"
+        if stats.get("worst_trade"):
+            wt = stats["worst_trade"]
+            msg += f"💀 Worst: {wt['token_symbol']} ({wt['roi_percent']:+.1f}%)\n"
+
         await self.send_message(msg)
 
 

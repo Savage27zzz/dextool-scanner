@@ -1,6 +1,7 @@
 import asyncio
 import signal
 import sys
+import datetime as dt
 from datetime import datetime, timezone
 
 import aiohttp
@@ -47,6 +48,9 @@ from config import (
     MAX_OPEN_POSITIONS,
     MAX_DAILY_LOSS,
     MAX_BUY_AMOUNT,
+    SELL_TIERS_RAW,
+    API_ENABLED,
+    API_PORT,
     logger,
 )
 from crypto_utils import encrypt_key, decrypt_key
@@ -57,7 +61,8 @@ from honeypot import check_honeypot
 from scanner import scan_all_sources
 from trader import create_trader, create_user_trader, _load_solana_keypair, _get_shared_client
 from whale_tracker import WhaleTracker
-from config import WHALE_TRACKING_ENABLED, WHALE_CHECK_INTERVAL, WHALE_MIN_SOL
+from config import WHALE_TRACKING_ENABLED, WHALE_CHECK_INTERVAL, WHALE_MIN_SOL, WHALE_COPY_ENABLED, WHALE_COPY_AMOUNT
+from api import start_api_server, stop_api_server
 
 trader = None
 monitor: ProfitMonitor | None = None
@@ -66,8 +71,10 @@ scanner_task: asyncio.Task | None = None
 monitor_task: asyncio.Task | None = None
 whale_tracker: WhaleTracker | None = None
 whale_task: asyncio.Task | None = None
+daily_report_task: asyncio.Task | None = None
 is_running: bool = False
 _pending_buys: dict[str, str] = {}
+api_runner = None
 
 
 def _is_admin(update) -> bool:
@@ -281,6 +288,7 @@ async def cmd_help(update, context):
         lines.append("/autotrade on|off — Toggle auto-trading")
         lines.append("/withdraw &lt;amount&gt; &lt;address&gt; — Withdraw SOL")
         lines.append("/export — Export wallet credentials (DM only)")
+        lines.append("/stats — Detailed trading performance analytics")
         if is_admin:
             lines.append("\n<b>Admin only:</b>")
             lines.append("/start — Start scanning and trading")
@@ -294,7 +302,12 @@ async def cmd_help(update, context):
             lines.append("/addwhale &lt;address&gt; [label] — Track a whale wallet")
             lines.append("/removewhale &lt;address&gt; — Stop tracking a whale wallet")
             lines.append("/whales — List tracked whales &amp; recent events")
+            lines.append("/copytrade — Whale copy trading status")
             lines.append("/fees — Fee revenue stats")
+            lines.append("/stats all — All users' combined stats")
+            lines.append("/backtest [days] — Replay scoring strategy against history")
+            from config import API_ENABLED, API_PORT
+            lines.append(f"\nAPI: {'Enabled on port ' + str(API_PORT) if API_ENABLED else 'Disabled'}")
     else:
         uid = update.effective_user.id
         lines.append(f"Your user ID: <code>{uid}</code>")
@@ -327,7 +340,7 @@ async def cmd_start(update, context):
         await update.message.reply_text("Admin only.")
         return
 
-    global is_running, scanner_task, monitor_task, whale_task
+    global is_running, scanner_task, monitor_task, whale_task, daily_report_task
 
     if is_running:
         await update.message.reply_text("Bot is already running.")
@@ -338,6 +351,7 @@ async def cmd_start(update, context):
     monitor_task = asyncio.create_task(monitor.start())
     if whale_tracker:
         whale_task = asyncio.create_task(whale_tracker.start())
+    daily_report_task = asyncio.create_task(daily_report_loop())
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
     if CHAIN.upper() == "SOL":
@@ -366,7 +380,7 @@ async def cmd_stop(update, context):
         await update.message.reply_text("Admin only.")
         return
 
-    global is_running, scanner_task, monitor_task, whale_task
+    global is_running, scanner_task, monitor_task, whale_task, daily_report_task
 
     if not is_running:
         await update.message.reply_text("Bot is not running.")
@@ -383,13 +397,126 @@ async def cmd_stop(update, context):
         monitor_task.cancel()
     if whale_task and not whale_task.done():
         whale_task.cancel()
+    if daily_report_task and not daily_report_task.done():
+        daily_report_task.cancel()
 
     scanner_task = None
     monitor_task = None
     whale_task = None
+    daily_report_task = None
 
     await update.message.reply_html("🛑 <b>Bot Stopped</b>\nScanning and trading paused. Bot still responds to commands.")
     logger.info("Bot stopped by user %s", update.effective_user.id)
+
+
+def _format_stats_message(stats_all, stats_7d, stats_30d, native, title):
+    def _sign(v):
+        return f"+{v:.4f}" if v >= 0 else f"{v:.4f}"
+
+    msg_parts = [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"<b>{title}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "<b>All Time</b>",
+        f"   Trades: {stats_all['total_trades']} ({stats_all['winning_trades']}W / {stats_all['losing_trades']}L)",
+        f"   Win Rate: {stats_all['win_rate']:.1f}%",
+        f"   Avg ROI: {stats_all['avg_roi']:+.2f}%",
+        f"   Total PnL: {_sign(stats_all['total_pnl_native'])} {native}",
+        f"   Total Invested: {stats_all['total_invested']:.4f} {native}",
+        f"   Profit Factor: {stats_all['profit_factor']:.2f}" if stats_all['profit_factor'] != float('inf') else "   Profit Factor: ∞ (no losses)",
+    ]
+
+    if stats_all["best_trade"]:
+        bt = stats_all["best_trade"]
+        pnl = bt["sell_amount_native"] - bt["buy_amount_native"]
+        msg_parts.append(f"   🏆 Best: {bt['token_symbol']} ({bt['roi_percent']:+.1f}% / {_sign(pnl)} {native})")
+    if stats_all["worst_trade"]:
+        wt = stats_all["worst_trade"]
+        pnl = wt["sell_amount_native"] - wt["buy_amount_native"]
+        msg_parts.append(f"   💀 Worst: {wt['token_symbol']} ({wt['roi_percent']:+.1f}% / {_sign(pnl)} {native})")
+
+    avg_dur = int(stats_all.get("avg_duration_seconds", 0))
+    msg_parts.append(f"   ⏱ Avg Duration: {_format_duration(avg_dur)}")
+
+    if stats_7d["total_trades"] > 0:
+        msg_parts.extend([
+            "",
+            "<b>Last 7 Days</b>",
+            f"   Trades: {stats_7d['total_trades']} | Win Rate: {stats_7d['win_rate']:.1f}%",
+            f"   PnL: {_sign(stats_7d['total_pnl_native'])} {native} | Avg ROI: {stats_7d['avg_roi']:+.2f}%",
+        ])
+
+    if stats_30d["total_trades"] > 0:
+        msg_parts.extend([
+            "",
+            "<b>Last 30 Days</b>",
+            f"   Trades: {stats_30d['total_trades']} | Win Rate: {stats_30d['win_rate']:.1f}%",
+            f"   PnL: {_sign(stats_30d['total_pnl_native'])} {native} | Avg ROI: {stats_30d['avg_roi']:+.2f}%",
+        ])
+
+    daily = stats_all.get("daily_pnl", [])
+    if daily:
+        msg_parts.extend(["", "<b>Daily PnL (Last 7 Days)</b>"])
+        for d in daily:
+            pnl = d["pnl"]
+            icon = "🟢" if pnl >= 0 else "🔴"
+            msg_parts.append(f"   {icon} {d['day']}: {_sign(pnl)} {native} ({d['trades']} trades, {d['wins']}W)")
+
+    return "\n".join(msg_parts)
+
+
+async def cmd_stats(update, context):
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    user_id = update.effective_user.id
+    is_admin = _is_admin(update)
+    show_all = is_admin and context.args and context.args[0].lower() == "all"
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+
+    target_user = None if show_all else user_id
+
+    stats_all = await db.get_trade_stats(user_id=target_user)
+    stats_7d = await db.get_trade_stats(user_id=target_user, days=7)
+    stats_30d = await db.get_trade_stats(user_id=target_user, days=30)
+
+    if stats_all["total_trades"] == 0:
+        await update.message.reply_text("No completed trades to analyze.")
+        return
+
+    title = "📊 ALL USERS STATS" if show_all else "📊 YOUR TRADING STATS"
+    msg = _format_stats_message(stats_all, stats_7d, stats_30d, native, title)
+
+    keyboard = [[InlineKeyboardButton("🔄 Refresh Stats", callback_data="stats_refresh")]]
+    await update.message.reply_html(
+        msg,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def daily_report_loop():
+    while is_running:
+        now = datetime.now(timezone.utc)
+        tomorrow = (now + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        wait_seconds = (tomorrow - now).total_seconds()
+        await asyncio.sleep(wait_seconds)
+
+        if not is_running:
+            break
+
+        try:
+            native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+            stats = await db.get_trade_stats(days=1)
+
+            if stats["total_trades"] == 0:
+                continue
+
+            await notifier.notify_daily_report(stats, native)
+
+        except Exception as exc:
+            logger.error("Daily report error: %s", exc)
 
 
 async def cmd_wallet(update, context):
@@ -734,14 +861,19 @@ async def cmd_config(update, context):
         f"Whale Tracking: {'Enabled' if WHALE_TRACKING_ENABLED else 'Disabled'}\n"
         f"Whale Check Interval: {WHALE_CHECK_INTERVAL}s\n"
         f"Whale Min SOL: {WHALE_MIN_SOL} SOL\n"
+        f"Whale Copy Trade: {'Enabled' if WHALE_COPY_ENABLED else 'Disabled'}\n"
+        f"Copy Amount: {WHALE_COPY_AMOUNT} {NATIVE_SYMBOL.get(CHAIN.upper(), 'SOL')}\n"
         f"Anti-Rug: {'Enabled' if ANTIRUG_ENABLED else 'Disabled'}\n"
         f"Anti-Rug Min Liquidity: ${ANTIRUG_MIN_LIQ:,}\n"
         f"Anti-Rug Drop Threshold: {ANTIRUG_LIQ_DROP_PCT}%\n"
         f"Operator Fee: {OPERATOR_FEE_PCT}% ({'Enabled' if OPERATOR_FEE_ENABLED else 'Disabled'})"
+        f"\nSell Tiers: {SELL_TIERS_RAW if SELL_TIERS_RAW else 'None (full sell at TP)'}"
         f"\n\n<b>Risk Management</b>\n"
         f"Max Positions: {MAX_OPEN_POSITIONS} per user\n"
         f"Max Daily Loss: {MAX_DAILY_LOSS} {NATIVE_SYMBOL.get(CHAIN.upper(), 'SOL')}\n"
         f"Max Buy Amount: {MAX_BUY_AMOUNT} {NATIVE_SYMBOL.get(CHAIN.upper(), 'SOL')}"
+        f"\n\n<b>External API</b>\n"
+        f"API Server: {'Enabled (port ' + str(API_PORT) + ')' if API_ENABLED else 'Disabled'}"
     )
     await update.message.reply_html(msg)
 
@@ -1371,6 +1503,29 @@ async def cmd_whales(update, context):
     await update.message.reply_html("\n".join(lines))
 
 
+async def cmd_copytrade(update, context):
+    """Toggle or show copy trading status."""
+    await _register_chat(update)
+    if not _is_admin(update):
+        await update.message.reply_text("Admin only.")
+        return
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+
+    status = "✅ Enabled" if WHALE_COPY_ENABLED else "❌ Disabled"
+    msg = (
+        "🐋 <b>Whale Copy Trading</b>\n\n"
+        f"Status: {status}\n"
+        f"Copy Amount: {WHALE_COPY_AMOUNT} {native}\n"
+        f"Chain: {CHAIN}\n\n"
+        "Configure via environment variables:\n"
+        "<code>WHALE_COPY_ENABLED=true</code>\n"
+        "<code>WHALE_COPY_AMOUNT=0.1</code>\n"
+        "<code>WHALE_COPY_MAX_PER_TOKEN=1</code>"
+    )
+    await update.message.reply_html(msg)
+
+
 async def cmd_fees(update, context):
     await _register_chat(update)
     if not _is_admin(update):
@@ -1438,6 +1593,9 @@ async def post_init(application):
 
     trading_users = await db.get_all_trading_users()
 
+    global api_runner
+    api_runner = await start_api_server()
+
     logger.info("Bot initialised – chain=%s, balance=%.6f %s, traders=%d", CHAIN, balance, native, len(trading_users))
     scanner_mode = "DexTools + DexScreener" if DEXTOOLS_API_KEY else "DexScreener only (free)"
     await notifier.send_message(
@@ -1450,8 +1608,10 @@ async def post_init(application):
 
 
 async def shutdown(application):
-    global is_running
+    global is_running, api_runner
     is_running = False
+    await stop_api_server(api_runner)
+    api_runner = None
     if whale_tracker:
         await whale_tracker.stop()
     if monitor:
@@ -2159,6 +2319,25 @@ async def handle_callback(update, context):
                 amount = float(parts[2])
                 await _handle_quickbuy_callback(query, user_id, token_prefix, amount)
 
+        elif data == "stats_refresh":
+            native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+            stats_all = await db.get_trade_stats(user_id=user_id)
+            stats_7d = await db.get_trade_stats(user_id=user_id, days=7)
+            stats_30d = await db.get_trade_stats(user_id=user_id, days=30)
+
+            if stats_all["total_trades"] == 0:
+                await query.edit_message_text("No completed trades to analyze.")
+                return
+
+            msg = _format_stats_message(stats_all, stats_7d, stats_30d, native, "📊 YOUR TRADING STATS")
+            keyboard = [[InlineKeyboardButton("🔄 Refresh Stats", callback_data="stats_refresh")]]
+            await query.edit_message_text(
+                msg,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+
         elif data == "config_show":
             msg = (
                 "⚙️ <b>Configuration</b>\n\n"
@@ -2175,10 +2354,15 @@ async def handle_callback(update, context):
                 f"Min Safety Score: {MIN_SCORE}/100\n"
                 f"Scan Interval: {SCAN_INTERVAL}s\n"
                 f"Monitor Interval: {MONITOR_INTERVAL}s"
+                f"\nWhale Copy Trade: {'Enabled' if WHALE_COPY_ENABLED else 'Disabled'}"
+                f"\nCopy Amount: {WHALE_COPY_AMOUNT} {NATIVE_SYMBOL.get(CHAIN.upper(), 'SOL')}"
+                f"\nSell Tiers: {SELL_TIERS_RAW if SELL_TIERS_RAW else 'None (full sell at TP)'}"
                 f"\n\n<b>Risk Management</b>\n"
                 f"Max Positions: {MAX_OPEN_POSITIONS} per user\n"
                 f"Max Daily Loss: {MAX_DAILY_LOSS} {NATIVE_SYMBOL.get(CHAIN.upper(), 'SOL')}\n"
                 f"Max Buy Amount: {MAX_BUY_AMOUNT} {NATIVE_SYMBOL.get(CHAIN.upper(), 'SOL')}"
+                f"\n\n<b>External API</b>\n"
+                f"API Server: {'Enabled (port ' + str(API_PORT) + ')' if API_ENABLED else 'Disabled'}"
             )
             await query.edit_message_text(msg, parse_mode="HTML")
 
@@ -2191,6 +2375,74 @@ async def handle_callback(update, context):
             await query.edit_message_text(f"❌ Error: {str(exc)[:200]}")
         except Exception:
             pass
+
+
+async def cmd_backtest(update, context):
+    """Replay scoring strategy against historical scan data."""
+    await _register_chat(update)
+    if not _is_admin(update):
+        await update.message.reply_text("Admin only.")
+        return
+
+    days = 7
+    if context.args:
+        try:
+            days = int(context.args[0])
+            days = max(1, min(days, 90))
+        except ValueError:
+            pass
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    data = await db.get_backtest_data(days=days)
+    summary = data["summary"]
+
+    if not summary or summary.get("total_scanned", 0) == 0:
+        await update.message.reply_text(f"No scan history for the last {days} days. Start the bot and scan some tokens first.")
+        return
+
+    msg_parts = [
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        f"\U0001f9ea <b>BACKTEST \u2014 Last {days} Days</b>",
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        "",
+        "<b>Scan Summary</b>",
+        f"   Total Scanned: {summary['total_scanned']}",
+        f"   Bought: {summary['total_bought'] or 0}",
+        f"   Avg Score: {summary['avg_score']:.1f}",
+        f"   Score Range: {summary['min_score']} \u2013 {summary['max_score']}",
+        f"   Current MIN_SCORE: {MIN_SCORE}",
+    ]
+
+    ranges = data.get("score_ranges", [])
+    if ranges:
+        msg_parts.extend(["", "<b>Score Distribution</b>"])
+        for r in ranges:
+            bar_len = min(int(r["total_scanned"] / max(summary["total_scanned"], 1) * 20), 20)
+            bar = "\u2588" * bar_len
+            msg_parts.append(f"   {r['score_range']}: {r['total_scanned']} tokens {bar}")
+
+    sims = data.get("simulations", [])
+    if sims:
+        msg_parts.extend(["", "<b>MIN_SCORE Simulations</b>"])
+        msg_parts.append("   Score | Would Buy | Traded | Win% | Avg ROI")
+        for s in sims:
+            marker = " \u25c0" if s["threshold"] == MIN_SCORE else ""
+            win_rate = f"{s['win_rate']:.0f}%" if s['traded'] > 0 else "N/A"
+            avg_roi = f"{s['avg_roi']:+.1f}%" if s['traded'] > 0 else "N/A"
+            msg_parts.append(
+                f"   \u2265{s['threshold']:3d}  |  {s['would_buy']:5d}    |  {s['traded']:4d}   | {win_rate:>4s} | {avg_roi:>7s}{marker}"
+            )
+
+    outcomes = data.get("trade_outcomes", [])
+    if outcomes:
+        msg_parts.extend(["", f"<b>Trade Outcomes by Score (last {days}d)</b>"])
+        for o in outcomes[:15]:
+            icon = "\U0001f7e2" if o["roi_percent"] > 0 else "\U0001f534"
+            pnl = o["sell_amount_native"] - o["buy_amount_native"]
+            sign = "+" if pnl >= 0 else ""
+            msg_parts.append(f"   {icon} [{o['score']}] {o['symbol']}: {o['roi_percent']:+.1f}% ({sign}{pnl:.4f} {native})")
+
+    await update.message.reply_html("\n".join(msg_parts))
 
 
 def main():
@@ -2225,7 +2477,10 @@ def main():
     app.add_handler(CommandHandler("addwhale", cmd_addwhale))
     app.add_handler(CommandHandler("removewhale", cmd_removewhale))
     app.add_handler(CommandHandler("whales", cmd_whales))
+    app.add_handler(CommandHandler("copytrade", cmd_copytrade))
     app.add_handler(CommandHandler("fees", cmd_fees))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("backtest", cmd_backtest))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     def _handle_signal(signum, frame):
