@@ -12,4 +12,6 @@ COPY . .
 # Create volume mount point for persistent data
 VOLUME ["/app/data"]
 
+EXPOSE 8080
+
 CMD ["python", "bot.py"]

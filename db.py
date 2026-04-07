@@ -123,6 +123,28 @@ CREATE TABLE IF NOT EXISTS bot_chats (
 );
 """
 
+_CREATE_SCAN_HISTORY = """
+CREATE TABLE IF NOT EXISTS scan_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    contract_address TEXT NOT NULL,
+    chain TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    name TEXT NOT NULL,
+    score INTEGER NOT NULL,
+    score_breakdown TEXT,
+    market_cap REAL,
+    liquidity REAL,
+    volume_24h REAL,
+    price_usd REAL,
+    holders INTEGER,
+    buy_tax REAL,
+    sell_tax REAL,
+    source TEXT DEFAULT '',
+    was_bought INTEGER DEFAULT 0,
+    scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 _CREATE_FEE_LEDGER = """
 CREATE TABLE IF NOT EXISTS fee_ledger (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,6 +180,7 @@ async def init_db():
         await db.execute(_CREATE_USER_WALLETS)
         await db.execute(_CREATE_BOT_CHATS)
         await db.execute(_CREATE_FEE_LEDGER)
+        await db.execute(_CREATE_SCAN_HISTORY)
         try:
             await db.execute("ALTER TABLE open_positions ADD COLUMN peak_price REAL DEFAULT 0")
         except Exception:
@@ -757,3 +780,259 @@ async def get_fee_history(limit: int = 20) -> list[dict]:
         )
         rows = await cursor.fetchall()
     return [dict(r) for r in rows]
+
+
+async def get_trade_stats(user_id: int | None = None, days: int | None = None) -> dict:
+    """
+    Get comprehensive trade statistics.
+    If user_id is None, returns stats for all users.
+    If days is set, only includes trades from the last N days.
+    """
+    conditions = []
+    params = []
+
+    if user_id is not None:
+        conditions.append("user_id = ?")
+        params.append(user_id)
+    if days is not None:
+        conditions.append("closed_at >= datetime('now', ?)")
+        params.append(f"-{days} days")
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute(f"""
+            SELECT
+                COUNT(*) as total_trades,
+                COALESCE(SUM(CASE WHEN roi_percent > 0 THEN 1 ELSE 0 END), 0) as winning_trades,
+                COALESCE(SUM(CASE WHEN roi_percent <= 0 THEN 1 ELSE 0 END), 0) as losing_trades,
+                COALESCE(AVG(roi_percent), 0) as avg_roi,
+                COALESCE(MAX(roi_percent), 0) as best_roi,
+                COALESCE(MIN(roi_percent), 0) as worst_roi,
+                COALESCE(SUM(sell_amount_native - buy_amount_native), 0) as total_pnl_native,
+                COALESCE(SUM(CASE WHEN roi_percent > 0 THEN sell_amount_native - buy_amount_native ELSE 0 END), 0) as total_profit,
+                COALESCE(SUM(CASE WHEN roi_percent <= 0 THEN sell_amount_native - buy_amount_native ELSE 0 END), 0) as total_loss,
+                COALESCE(SUM(buy_amount_native), 0) as total_invested,
+                COALESCE(AVG(duration_seconds), 0) as avg_duration_seconds
+            FROM completed_trades {where}
+        """, params)
+        stats = dict(await cursor.fetchone())
+
+        cursor = await db.execute(f"""
+            SELECT token_symbol, roi_percent, buy_amount_native, sell_amount_native
+            FROM completed_trades {where}
+            ORDER BY roi_percent DESC LIMIT 1
+        """, params)
+        best = await cursor.fetchone()
+        stats["best_trade"] = dict(best) if best else None
+
+        cursor = await db.execute(f"""
+            SELECT token_symbol, roi_percent, buy_amount_native, sell_amount_native
+            FROM completed_trades {where}
+            ORDER BY roi_percent ASC LIMIT 1
+        """, params)
+        worst = await cursor.fetchone()
+        stats["worst_trade"] = dict(worst) if worst else None
+
+        daily_conditions = ["closed_at >= datetime('now', '-7 days')"]
+        daily_params = []
+        if user_id is not None:
+            daily_conditions.insert(0, "user_id = ?")
+            daily_params.append(user_id)
+        daily_where = f"WHERE {' AND '.join(daily_conditions)}"
+
+        cursor = await db.execute(f"""
+            SELECT
+                DATE(closed_at) as day,
+                COUNT(*) as trades,
+                COALESCE(SUM(sell_amount_native - buy_amount_native), 0) as pnl,
+                COALESCE(SUM(CASE WHEN roi_percent > 0 THEN 1 ELSE 0 END), 0) as wins
+            FROM completed_trades
+            {daily_where}
+            GROUP BY DATE(closed_at)
+            ORDER BY day DESC
+        """, daily_params)
+        stats["daily_pnl"] = [dict(r) for r in await cursor.fetchall()]
+
+    total = stats["total_trades"]
+    stats["win_rate"] = (stats["winning_trades"] / total * 100) if total > 0 else 0
+    stats["profit_factor"] = abs(stats["total_profit"] / stats["total_loss"]) if stats["total_loss"] != 0 else float('inf') if stats["total_profit"] > 0 else 0
+
+    return stats
+
+
+async def save_scan_history(token: dict, was_bought: bool = False):
+    """Log a scanned token to history for backtesting."""
+    sql = """
+        INSERT INTO scan_history
+            (contract_address, chain, symbol, name, score, score_breakdown,
+             market_cap, liquidity, volume_24h, price_usd, holders,
+             buy_tax, sell_tax, source, was_bought)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    breakdown = token.get("score_breakdown")
+    if isinstance(breakdown, dict):
+        breakdown = json.dumps(breakdown)
+    params = (
+        token.get("contract_address", ""),
+        token.get("chain", ""),
+        token.get("symbol", ""),
+        token.get("name", ""),
+        token.get("score", 0),
+        breakdown,
+        token.get("market_cap", 0),
+        token.get("liquidity", 0),
+        token.get("volume_24h", 0),
+        token.get("price_usd", 0),
+        token.get("holders", 0),
+        token.get("buy_tax", 0),
+        token.get("sell_tax", 0),
+        token.get("source", ""),
+        1 if was_bought else 0,
+    )
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        await db.execute(sql, params)
+        await db.commit()
+
+
+async def save_scan_history_batch(tokens: list[dict], bought_addresses: set[str] | None = None):
+    """Log a batch of scanned tokens to history."""
+    if not tokens:
+        return
+    bought = bought_addresses or set()
+    sql = """
+        INSERT INTO scan_history
+            (contract_address, chain, symbol, name, score, score_breakdown,
+             market_cap, liquidity, volume_24h, price_usd, holders,
+             buy_tax, sell_tax, source, was_bought)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    rows = []
+    for t in tokens:
+        breakdown = t.get("score_breakdown")
+        if isinstance(breakdown, dict):
+            breakdown = json.dumps(breakdown)
+        addr = t.get("contract_address", "").lower()
+        rows.append((
+            t.get("contract_address", ""),
+            t.get("chain", ""),
+            t.get("symbol", ""),
+            t.get("name", ""),
+            t.get("score", 0),
+            breakdown,
+            t.get("market_cap", 0),
+            t.get("liquidity", 0),
+            t.get("volume_24h", 0),
+            t.get("price_usd", 0),
+            t.get("holders", 0),
+            t.get("buy_tax", 0),
+            t.get("sell_tax", 0),
+            t.get("source", ""),
+            1 if addr in bought else 0,
+        ))
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        await db.executemany(sql, rows)
+        await db.commit()
+    logger.debug("Saved %d tokens to scan_history", len(rows))
+
+
+async def get_backtest_data(days: int = 7) -> dict:
+    """Get scan history data for backtesting, cross-referenced with actual trade outcomes."""
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute("""
+            SELECT
+                CASE
+                    WHEN score >= 80 THEN '80-100'
+                    WHEN score >= 60 THEN '60-79'
+                    WHEN score >= 40 THEN '40-59'
+                    WHEN score >= 20 THEN '20-39'
+                    ELSE '0-19'
+                END as score_range,
+                COUNT(*) as total_scanned,
+                SUM(was_bought) as total_bought
+            FROM scan_history
+            WHERE scanned_at >= datetime('now', ?)
+            GROUP BY score_range
+            ORDER BY score_range DESC
+        """, (f"-{days} days",))
+        score_ranges = [dict(r) for r in await cursor.fetchall()]
+
+        cursor = await db.execute("""
+            SELECT
+                COUNT(*) as total_scanned,
+                SUM(was_bought) as total_bought,
+                AVG(score) as avg_score,
+                MIN(score) as min_score,
+                MAX(score) as max_score
+            FROM scan_history
+            WHERE scanned_at >= datetime('now', ?)
+        """, (f"-{days} days",))
+        summary = dict(await cursor.fetchone())
+
+        cursor = await db.execute("""
+            SELECT ds.score, ds.symbol, ct.roi_percent,
+                   ct.buy_amount_native, ct.sell_amount_native
+            FROM (
+                SELECT contract_address, chain, score, symbol,
+                       ROW_NUMBER() OVER (PARTITION BY LOWER(contract_address), chain
+                                          ORDER BY scanned_at DESC) as rn
+                FROM scan_history
+                WHERE scanned_at >= datetime('now', ?)
+            ) ds
+            INNER JOIN completed_trades ct ON LOWER(ds.contract_address) = LOWER(ct.token_address)
+                AND ds.chain = ct.chain
+            WHERE ds.rn = 1
+            ORDER BY ds.score DESC
+        """, (f"-{days} days",))
+        trade_outcomes = [dict(r) for r in await cursor.fetchall()]
+
+        thresholds = [20, 30, 40, 50, 60, 70, 80]
+        simulations = []
+        for threshold in thresholds:
+            cursor = await db.execute("""
+                SELECT COUNT(*) as would_buy
+                FROM scan_history
+                WHERE scanned_at >= datetime('now', ?)
+                  AND score >= ?
+            """, (f"-{days} days", threshold))
+            row = await cursor.fetchone()
+            would_buy = row[0] if row else 0
+
+            cursor = await db.execute("""
+                SELECT
+                    COUNT(*) as traded,
+                    COALESCE(SUM(CASE WHEN ct.roi_percent > 0 THEN 1 ELSE 0 END), 0) as wins,
+                    COALESCE(AVG(ct.roi_percent), 0) as avg_roi
+                FROM (
+                    SELECT contract_address, chain, score,
+                           ROW_NUMBER() OVER (PARTITION BY LOWER(contract_address), chain
+                                              ORDER BY scanned_at DESC) as rn
+                    FROM scan_history
+                    WHERE scanned_at >= datetime('now', ?)
+                      AND score >= ?
+                ) ds
+                INNER JOIN completed_trades ct ON LOWER(ds.contract_address) = LOWER(ct.token_address)
+                    AND ds.chain = ct.chain
+                WHERE ds.rn = 1
+            """, (f"-{days} days", threshold))
+            outcome = dict(await cursor.fetchone())
+
+            simulations.append({
+                "threshold": threshold,
+                "would_buy": would_buy,
+                "traded": outcome["traded"],
+                "wins": outcome["wins"],
+                "avg_roi": outcome["avg_roi"],
+                "win_rate": (outcome["wins"] / outcome["traded"] * 100) if outcome["traded"] > 0 else 0,
+            })
+
+    return {
+        "summary": summary,
+        "score_ranges": score_ranges,
+        "trade_outcomes": trade_outcomes,
+        "simulations": simulations,
+    }

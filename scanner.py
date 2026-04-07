@@ -408,4 +408,10 @@ async def scan_all_sources(session: aiohttp.ClientSession, chain: str | None = N
         len(scored), len(qualified), MIN_SCORE, len(scored) - len(qualified),
     )
 
+    bought_addresses = {t.get("contract_address", "").lower() for t in qualified}
+    try:
+        await db.save_scan_history_batch(scored, bought_addresses=bought_addresses)
+    except Exception as exc:
+        logger.error("Failed to save scan history: %s", exc)
+
     return qualified

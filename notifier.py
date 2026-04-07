@@ -249,6 +249,30 @@ class Notifier:
         await self.send_message(msg)
 
 
+    async def notify_daily_report(self, stats: dict, native: str):
+        def _sign(v):
+            return f"+{v:.4f}" if v >= 0 else f"{v:.4f}"
+
+        msg = (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📅 <b>DAILY REPORT</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Trades: {stats['total_trades']} ({stats['winning_trades']}W / {stats['losing_trades']}L)\n"
+            f"Win Rate: {stats['win_rate']:.1f}%\n"
+            f"PnL: {_sign(stats['total_pnl_native'])} {native}\n"
+            f"Avg ROI: {stats['avg_roi']:+.2f}%\n"
+        )
+
+        if stats.get("best_trade"):
+            bt = stats["best_trade"]
+            msg += f"🏆 Best: {bt['token_symbol']} ({bt['roi_percent']:+.1f}%)\n"
+        if stats.get("worst_trade"):
+            wt = stats["worst_trade"]
+            msg += f"💀 Worst: {wt['token_symbol']} ({wt['roi_percent']:+.1f}%)\n"
+
+        await self.send_message(msg)
+
+
 def _esc(text) -> str:
     if text is None:
         return ""
