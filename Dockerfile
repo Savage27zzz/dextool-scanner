@@ -9,8 +9,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source code
 COPY . .
 
-# Create volume mount point for persistent data
-VOLUME ["/app/data"]
+# Create data directory for persistent storage
+RUN mkdir -p /app/data
 
 EXPOSE 8080
 
