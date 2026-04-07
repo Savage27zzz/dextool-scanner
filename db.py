@@ -974,17 +974,19 @@ async def get_backtest_data(days: int = 7) -> dict:
         summary = dict(await cursor.fetchone())
 
         cursor = await db.execute("""
-            SELECT
-                sh.score,
-                sh.symbol,
-                ct.roi_percent,
-                ct.buy_amount_native,
-                ct.sell_amount_native
-            FROM scan_history sh
-            INNER JOIN completed_trades ct ON LOWER(sh.contract_address) = LOWER(ct.token_address)
-                AND sh.chain = ct.chain
-            WHERE sh.scanned_at >= datetime('now', ?)
-            ORDER BY sh.score DESC
+            SELECT ds.score, ds.symbol, ct.roi_percent,
+                   ct.buy_amount_native, ct.sell_amount_native
+            FROM (
+                SELECT contract_address, chain, score, symbol,
+                       ROW_NUMBER() OVER (PARTITION BY LOWER(contract_address), chain
+                                          ORDER BY scanned_at DESC) as rn
+                FROM scan_history
+                WHERE scanned_at >= datetime('now', ?)
+            ) ds
+            INNER JOIN completed_trades ct ON LOWER(ds.contract_address) = LOWER(ct.token_address)
+                AND ds.chain = ct.chain
+            WHERE ds.rn = 1
+            ORDER BY ds.score DESC
         """, (f"-{days} days",))
         trade_outcomes = [dict(r) for r in await cursor.fetchall()]
 
@@ -1005,11 +1007,17 @@ async def get_backtest_data(days: int = 7) -> dict:
                     COUNT(*) as traded,
                     COALESCE(SUM(CASE WHEN ct.roi_percent > 0 THEN 1 ELSE 0 END), 0) as wins,
                     COALESCE(AVG(ct.roi_percent), 0) as avg_roi
-                FROM scan_history sh
-                INNER JOIN completed_trades ct ON LOWER(sh.contract_address) = LOWER(ct.token_address)
-                    AND sh.chain = ct.chain
-                WHERE sh.scanned_at >= datetime('now', ?)
-                  AND sh.score >= ?
+                FROM (
+                    SELECT contract_address, chain, score,
+                           ROW_NUMBER() OVER (PARTITION BY LOWER(contract_address), chain
+                                              ORDER BY scanned_at DESC) as rn
+                    FROM scan_history
+                    WHERE scanned_at >= datetime('now', ?)
+                      AND score >= ?
+                ) ds
+                INNER JOIN completed_trades ct ON LOWER(ds.contract_address) = LOWER(ct.token_address)
+                    AND ds.chain = ct.chain
+                WHERE ds.rn = 1
             """, (f"-{days} days", threshold))
             outcome = dict(await cursor.fetchone())
 
