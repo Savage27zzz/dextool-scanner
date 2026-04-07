@@ -58,7 +58,7 @@ from honeypot import check_honeypot
 from scanner import scan_all_sources
 from trader import create_trader, create_user_trader, _load_solana_keypair, _get_shared_client
 from whale_tracker import WhaleTracker
-from config import WHALE_TRACKING_ENABLED, WHALE_CHECK_INTERVAL, WHALE_MIN_SOL
+from config import WHALE_TRACKING_ENABLED, WHALE_CHECK_INTERVAL, WHALE_MIN_SOL, WHALE_COPY_ENABLED, WHALE_COPY_AMOUNT
 
 trader = None
 monitor: ProfitMonitor | None = None
@@ -295,6 +295,7 @@ async def cmd_help(update, context):
             lines.append("/addwhale &lt;address&gt; [label] — Track a whale wallet")
             lines.append("/removewhale &lt;address&gt; — Stop tracking a whale wallet")
             lines.append("/whales — List tracked whales &amp; recent events")
+            lines.append("/copytrade — Whale copy trading status")
             lines.append("/fees — Fee revenue stats")
     else:
         uid = update.effective_user.id
@@ -735,6 +736,8 @@ async def cmd_config(update, context):
         f"Whale Tracking: {'Enabled' if WHALE_TRACKING_ENABLED else 'Disabled'}\n"
         f"Whale Check Interval: {WHALE_CHECK_INTERVAL}s\n"
         f"Whale Min SOL: {WHALE_MIN_SOL} SOL\n"
+        f"Whale Copy Trade: {'Enabled' if WHALE_COPY_ENABLED else 'Disabled'}\n"
+        f"Copy Amount: {WHALE_COPY_AMOUNT} {NATIVE_SYMBOL.get(CHAIN.upper(), 'SOL')}\n"
         f"Anti-Rug: {'Enabled' if ANTIRUG_ENABLED else 'Disabled'}\n"
         f"Anti-Rug Min Liquidity: ${ANTIRUG_MIN_LIQ:,}\n"
         f"Anti-Rug Drop Threshold: {ANTIRUG_LIQ_DROP_PCT}%\n"
@@ -1371,6 +1374,29 @@ async def cmd_whales(update, context):
         lines.append("No whale events recorded yet.")
 
     await update.message.reply_html("\n".join(lines))
+
+
+async def cmd_copytrade(update, context):
+    """Toggle or show copy trading status."""
+    await _register_chat(update)
+    if not _is_admin(update):
+        await update.message.reply_text("Admin only.")
+        return
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+
+    status = "✅ Enabled" if WHALE_COPY_ENABLED else "❌ Disabled"
+    msg = (
+        "🐋 <b>Whale Copy Trading</b>\n\n"
+        f"Status: {status}\n"
+        f"Copy Amount: {WHALE_COPY_AMOUNT} {native}\n"
+        f"Chain: {CHAIN}\n\n"
+        "Configure via environment variables:\n"
+        "<code>WHALE_COPY_ENABLED=true</code>\n"
+        "<code>WHALE_COPY_AMOUNT=0.1</code>\n"
+        "<code>WHALE_COPY_MAX_PER_TOKEN=1</code>"
+    )
+    await update.message.reply_html(msg)
 
 
 async def cmd_fees(update, context):
@@ -2177,6 +2203,8 @@ async def handle_callback(update, context):
                 f"Min Safety Score: {MIN_SCORE}/100\n"
                 f"Scan Interval: {SCAN_INTERVAL}s\n"
                 f"Monitor Interval: {MONITOR_INTERVAL}s"
+                f"\nWhale Copy Trade: {'Enabled' if WHALE_COPY_ENABLED else 'Disabled'}"
+                f"\nCopy Amount: {WHALE_COPY_AMOUNT} {NATIVE_SYMBOL.get(CHAIN.upper(), 'SOL')}"
                 f"\nSell Tiers: {SELL_TIERS_RAW if SELL_TIERS_RAW else 'None (full sell at TP)'}"
                 f"\n\n<b>Risk Management</b>\n"
                 f"Max Positions: {MAX_OPEN_POSITIONS} per user\n"
@@ -2228,6 +2256,7 @@ def main():
     app.add_handler(CommandHandler("addwhale", cmd_addwhale))
     app.add_handler(CommandHandler("removewhale", cmd_removewhale))
     app.add_handler(CommandHandler("whales", cmd_whales))
+    app.add_handler(CommandHandler("copytrade", cmd_copytrade))
     app.add_handler(CommandHandler("fees", cmd_fees))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
