@@ -648,6 +648,32 @@ async def get_fee_stats() -> dict:
     return dict(row)
 
 
+async def count_open_positions(user_id: int) -> int:
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM open_positions WHERE user_id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+    return row[0] if row else 0
+
+
+async def get_daily_realized_loss(user_id: int) -> float:
+    """Return total realized loss (as a positive number) for today's trades."""
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        cursor = await db.execute(
+            """
+            SELECT COALESCE(SUM(buy_amount_native - sell_amount_native), 0)
+            FROM completed_trades
+            WHERE user_id = ?
+              AND DATE(closed_at) = DATE('now')
+              AND sell_amount_native < buy_amount_native
+            """,
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+    return row[0] if row and row[0] else 0.0
+
+
 async def get_fee_history(limit: int = 20) -> list[dict]:
     async with aiosqlite.connect(str(DB_PATH)) as db:
         db.row_factory = aiosqlite.Row

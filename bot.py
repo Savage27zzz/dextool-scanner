@@ -44,6 +44,9 @@ from config import (
     ANTIRUG_LIQ_DROP_PCT,
     OPERATOR_FEE_PCT,
     OPERATOR_FEE_ENABLED,
+    MAX_OPEN_POSITIONS,
+    MAX_DAILY_LOSS,
+    MAX_BUY_AMOUNT,
     logger,
 )
 from crypto_utils import encrypt_key, decrypt_key
@@ -124,8 +127,11 @@ async def scanner_loop():
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
     logger.info("Scanner loop started (chain=%s, interval=%ds)", CHAIN, SCAN_INTERVAL)
 
+    _daily_loss_notified: set[int] = set()
+
     while is_running:
         try:
+            _daily_loss_notified.clear()
             async with aiohttp.ClientSession() as session:
                 tokens = await scan_all_sources(session, CHAIN)
 
@@ -166,6 +172,25 @@ async def scanner_loop():
                                 if already:
                                     continue
 
+                                # --- Risk Management Checks ---
+                                # 1. Max open positions
+                                open_count = await db.count_open_positions(uid)
+                                if open_count >= MAX_OPEN_POSITIONS:
+                                    logger.debug("User %d at max positions (%d/%d) — skipping %s",
+                                                 uid, open_count, MAX_OPEN_POSITIONS, token.get("symbol"))
+                                    continue
+
+                                # 2. Daily loss limit
+                                if MAX_DAILY_LOSS > 0:
+                                    daily_loss = await db.get_daily_realized_loss(uid)
+                                    if daily_loss >= MAX_DAILY_LOSS:
+                                        logger.info("User %d hit daily loss limit (%.4f/%.4f) — skipping",
+                                                     uid, daily_loss, MAX_DAILY_LOSS)
+                                        if uid not in _daily_loss_notified:
+                                            _daily_loss_notified.add(uid)
+                                            await notifier.notify_daily_loss_limit(uid, daily_loss, MAX_DAILY_LOSS, native)
+                                        continue
+
                                 user_trader = await create_user_trader(uid)
                                 if user_trader is None:
                                     continue
@@ -173,6 +198,11 @@ async def scanner_loop():
                                 buy_amount = await user_trader.get_buy_amount()
                                 if buy_amount <= 0:
                                     continue
+
+                                # 3. Max buy amount cap
+                                if MAX_BUY_AMOUNT > 0 and buy_amount > MAX_BUY_AMOUNT:
+                                    buy_amount = MAX_BUY_AMOUNT
+                                    logger.debug("Capped buy for user %d to %.4f", uid, MAX_BUY_AMOUNT)
 
                                 await notifier.send_to_user(
                                     uid,
@@ -708,6 +738,10 @@ async def cmd_config(update, context):
         f"Anti-Rug Min Liquidity: ${ANTIRUG_MIN_LIQ:,}\n"
         f"Anti-Rug Drop Threshold: {ANTIRUG_LIQ_DROP_PCT}%\n"
         f"Operator Fee: {OPERATOR_FEE_PCT}% ({'Enabled' if OPERATOR_FEE_ENABLED else 'Disabled'})"
+        f"\n\n<b>Risk Management</b>\n"
+        f"Max Positions: {MAX_OPEN_POSITIONS} per user\n"
+        f"Max Daily Loss: {MAX_DAILY_LOSS} {NATIVE_SYMBOL.get(CHAIN.upper(), 'SOL')}\n"
+        f"Max Buy Amount: {MAX_BUY_AMOUNT} {NATIVE_SYMBOL.get(CHAIN.upper(), 'SOL')}"
     )
     await update.message.reply_html(msg)
 
@@ -766,6 +800,24 @@ async def cmd_buy(update, context):
         )
         logger.warning("Manual buy blocked — honeypot: %s", token_address)
         return
+
+    # Risk management checks for manual buys
+    open_count = await db.count_open_positions(user_id)
+    if open_count >= MAX_OPEN_POSITIONS:
+        await update.message.reply_text(f"⚠️ Max positions reached ({open_count}/{MAX_OPEN_POSITIONS}). Sell a position first.")
+        return
+
+    if MAX_DAILY_LOSS > 0:
+        daily_loss = await db.get_daily_realized_loss(user_id)
+        if daily_loss >= MAX_DAILY_LOSS:
+            native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+            await update.message.reply_html(
+                f"⚠️ Daily loss limit reached ({daily_loss:.4f}/{MAX_DAILY_LOSS} {native}). Trading paused until tomorrow."
+            )
+            return
+
+    if MAX_BUY_AMOUNT > 0 and buy_amount > MAX_BUY_AMOUNT:
+        buy_amount = MAX_BUY_AMOUNT
 
     tp = token_address[:16]
     _pending_buys[f"{user_id}:{tp}"] = token_address
@@ -1547,6 +1599,24 @@ async def _handle_buy_confirm_callback(query, user_id, token_prefix, amount):
         return
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+
+    # Risk management checks for inline buy confirm
+    open_count = await db.count_open_positions(user_id)
+    if open_count >= MAX_OPEN_POSITIONS:
+        await query.edit_message_text(f"⚠️ Max positions reached ({open_count}/{MAX_OPEN_POSITIONS}). Sell a position first.")
+        return
+
+    if MAX_DAILY_LOSS > 0:
+        daily_loss = await db.get_daily_realized_loss(user_id)
+        if daily_loss >= MAX_DAILY_LOSS:
+            await query.edit_message_text(
+                f"⚠️ Daily loss limit reached ({daily_loss:.4f}/{MAX_DAILY_LOSS} {native}). Trading paused until tomorrow."
+            )
+            return
+
+    if MAX_BUY_AMOUNT > 0 and amount > MAX_BUY_AMOUNT:
+        amount = MAX_BUY_AMOUNT
+
     await query.edit_message_text(
         f"🔄 Executing buy of {amount:.4f} {native}...",
     )
@@ -1630,6 +1700,22 @@ async def _handle_quickbuy_callback(query, user_id, token_prefix, amount):
     if already:
         await query.answer("Already holding this token.", show_alert=True)
         return
+
+    # Risk management checks for quick buy
+    open_count = await db.count_open_positions(user_id)
+    if open_count >= MAX_OPEN_POSITIONS:
+        await query.answer(f"Max positions reached ({open_count}/{MAX_OPEN_POSITIONS}). Sell first.", show_alert=True)
+        return
+
+    if MAX_DAILY_LOSS > 0:
+        daily_loss = await db.get_daily_realized_loss(user_id)
+        if daily_loss >= MAX_DAILY_LOSS:
+            native_sym = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+            await query.answer(f"Daily loss limit reached ({daily_loss:.4f}/{MAX_DAILY_LOSS} {native_sym}).", show_alert=True)
+            return
+
+    if MAX_BUY_AMOUNT > 0 and amount > MAX_BUY_AMOUNT:
+        amount = MAX_BUY_AMOUNT
 
     user_trader = await create_user_trader(user_id)
     if user_trader is None:
@@ -2089,6 +2175,10 @@ async def handle_callback(update, context):
                 f"Min Safety Score: {MIN_SCORE}/100\n"
                 f"Scan Interval: {SCAN_INTERVAL}s\n"
                 f"Monitor Interval: {MONITOR_INTERVAL}s"
+                f"\n\n<b>Risk Management</b>\n"
+                f"Max Positions: {MAX_OPEN_POSITIONS} per user\n"
+                f"Max Daily Loss: {MAX_DAILY_LOSS} {NATIVE_SYMBOL.get(CHAIN.upper(), 'SOL')}\n"
+                f"Max Buy Amount: {MAX_BUY_AMOUNT} {NATIVE_SYMBOL.get(CHAIN.upper(), 'SOL')}"
             )
             await query.edit_message_text(msg, parse_mode="HTML")
 

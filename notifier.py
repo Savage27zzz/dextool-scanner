@@ -188,6 +188,15 @@ class Notifier:
         )
         await self.send_message(msg, chat_id=chat_id)
 
+    async def notify_daily_loss_limit(self, user_id: int, daily_loss: float, limit: float, native: str):
+        msg = (
+            "⚠️ <b>DAILY LOSS LIMIT REACHED</b>\n"
+            f"Today's losses: {daily_loss:.4f} {native}\n"
+            f"Limit: {limit} {native}\n"
+            "Auto-trading paused until tomorrow."
+        )
+        await self.send_to_user(user_id, msg)
+
     async def notify_error(self, error_msg: str, chat_id: int | None = None):
         msg = f"⚠️ <b>ERROR</b>\n<code>{_esc(error_msg)}</code>"
         await self.send_message(msg, chat_id=chat_id)
