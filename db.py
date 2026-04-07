@@ -757,3 +757,84 @@ async def get_fee_history(limit: int = 20) -> list[dict]:
         )
         rows = await cursor.fetchall()
     return [dict(r) for r in rows]
+
+
+async def get_trade_stats(user_id: int | None = None, days: int | None = None) -> dict:
+    """
+    Get comprehensive trade statistics.
+    If user_id is None, returns stats for all users.
+    If days is set, only includes trades from the last N days.
+    """
+    conditions = []
+    params = []
+
+    if user_id is not None:
+        conditions.append("user_id = ?")
+        params.append(user_id)
+    if days is not None:
+        conditions.append("closed_at >= datetime('now', ?)")
+        params.append(f"-{days} days")
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute(f"""
+            SELECT
+                COUNT(*) as total_trades,
+                COALESCE(SUM(CASE WHEN roi_percent > 0 THEN 1 ELSE 0 END), 0) as winning_trades,
+                COALESCE(SUM(CASE WHEN roi_percent <= 0 THEN 1 ELSE 0 END), 0) as losing_trades,
+                COALESCE(AVG(roi_percent), 0) as avg_roi,
+                COALESCE(MAX(roi_percent), 0) as best_roi,
+                COALESCE(MIN(roi_percent), 0) as worst_roi,
+                COALESCE(SUM(sell_amount_native - buy_amount_native), 0) as total_pnl_native,
+                COALESCE(SUM(CASE WHEN roi_percent > 0 THEN sell_amount_native - buy_amount_native ELSE 0 END), 0) as total_profit,
+                COALESCE(SUM(CASE WHEN roi_percent <= 0 THEN sell_amount_native - buy_amount_native ELSE 0 END), 0) as total_loss,
+                COALESCE(SUM(buy_amount_native), 0) as total_invested,
+                COALESCE(AVG(duration_seconds), 0) as avg_duration_seconds
+            FROM completed_trades {where}
+        """, params)
+        stats = dict(await cursor.fetchone())
+
+        cursor = await db.execute(f"""
+            SELECT token_symbol, roi_percent, buy_amount_native, sell_amount_native
+            FROM completed_trades {where}
+            ORDER BY roi_percent DESC LIMIT 1
+        """, params)
+        best = await cursor.fetchone()
+        stats["best_trade"] = dict(best) if best else None
+
+        cursor = await db.execute(f"""
+            SELECT token_symbol, roi_percent, buy_amount_native, sell_amount_native
+            FROM completed_trades {where}
+            ORDER BY roi_percent ASC LIMIT 1
+        """, params)
+        worst = await cursor.fetchone()
+        stats["worst_trade"] = dict(worst) if worst else None
+
+        daily_conditions = ["closed_at >= datetime('now', '-7 days')"]
+        daily_params = []
+        if user_id is not None:
+            daily_conditions.insert(0, "user_id = ?")
+            daily_params.append(user_id)
+        daily_where = f"WHERE {' AND '.join(daily_conditions)}"
+
+        cursor = await db.execute(f"""
+            SELECT
+                DATE(closed_at) as day,
+                COUNT(*) as trades,
+                COALESCE(SUM(sell_amount_native - buy_amount_native), 0) as pnl,
+                COALESCE(SUM(CASE WHEN roi_percent > 0 THEN 1 ELSE 0 END), 0) as wins
+            FROM completed_trades
+            {daily_where}
+            GROUP BY DATE(closed_at)
+            ORDER BY day DESC
+        """, daily_params)
+        stats["daily_pnl"] = [dict(r) for r in await cursor.fetchall()]
+
+    total = stats["total_trades"]
+    stats["win_rate"] = (stats["winning_trades"] / total * 100) if total > 0 else 0
+    stats["profit_factor"] = abs(stats["total_profit"] / stats["total_loss"]) if stats["total_loss"] != 0 else float('inf') if stats["total_profit"] > 0 else 0
+
+    return stats
