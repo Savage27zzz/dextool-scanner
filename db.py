@@ -145,6 +145,20 @@ CREATE TABLE IF NOT EXISTS scan_history (
 );
 """
 
+_CREATE_SNIPE_TARGETS = """
+CREATE TABLE IF NOT EXISTS snipe_targets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_address TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    amount REAL DEFAULT 0,
+    status TEXT DEFAULT 'active',
+    buy_tx_hash TEXT DEFAULT '',
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    filled_at TIMESTAMP,
+    UNIQUE(token_address, user_id)
+);
+"""
+
 _CREATE_FEE_LEDGER = """
 CREATE TABLE IF NOT EXISTS fee_ledger (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -181,6 +195,7 @@ async def init_db():
         await db.execute(_CREATE_BOT_CHATS)
         await db.execute(_CREATE_FEE_LEDGER)
         await db.execute(_CREATE_SCAN_HISTORY)
+        await db.execute(_CREATE_SNIPE_TARGETS)
         try:
             await db.execute("ALTER TABLE open_positions ADD COLUMN peak_price REAL DEFAULT 0")
         except Exception:
@@ -1048,3 +1063,54 @@ async def get_recent_detected_tokens(limit: int = 10) -> list[dict]:
         )
         rows = await cursor.fetchall()
     return [dict(r) for r in rows]
+
+
+async def add_snipe_target(token_address: str, user_id: int, amount: float = 0) -> bool:
+    try:
+        async with aiosqlite.connect(str(DB_PATH)) as db:
+            cursor = await db.execute(
+                "INSERT OR IGNORE INTO snipe_targets (token_address, user_id, amount) VALUES (?, ?, ?)",
+                (token_address, user_id, amount),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+    except Exception:
+        return False
+
+
+async def remove_snipe_target(token_address: str, user_id: int) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        cursor = await db.execute(
+            "DELETE FROM snipe_targets WHERE token_address = ? AND user_id = ?",
+            (token_address, user_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def get_active_snipe_targets() -> list[dict]:
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT * FROM snipe_targets WHERE status = 'active' ORDER BY added_at ASC"
+        )
+    return [dict(r) for r in rows]
+
+
+async def get_user_snipe_targets(user_id: int) -> list[dict]:
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT * FROM snipe_targets WHERE user_id = ? AND status = 'active' ORDER BY added_at DESC",
+            (user_id,),
+        )
+    return [dict(r) for r in rows]
+
+
+async def mark_snipe_filled(token_address: str, user_id: int, tx_hash: str):
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        await db.execute(
+            "UPDATE snipe_targets SET status = 'filled', buy_tx_hash = ?, filled_at = CURRENT_TIMESTAMP WHERE token_address = ? AND user_id = ?",
+            (tx_hash, token_address, user_id),
+        )
+        await db.commit()

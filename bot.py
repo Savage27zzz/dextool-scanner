@@ -63,6 +63,8 @@ from trader import create_trader, create_user_trader, _load_solana_keypair, _get
 from whale_tracker import WhaleTracker
 from config import WHALE_TRACKING_ENABLED, WHALE_CHECK_INTERVAL, WHALE_MIN_SOL, WHALE_COPY_ENABLED, WHALE_COPY_AMOUNT
 from api import start_api_server, stop_api_server
+from config import SNIPER_ENABLED, SNIPER_CHECK_INTERVAL, SNIPER_MIN_LIQUIDITY
+from sniper import Sniper
 
 trader = None
 monitor: ProfitMonitor | None = None
@@ -76,6 +78,8 @@ is_running: bool = False
 alerts_enabled: bool = False
 _pending_buys: dict[str, str] = {}
 api_runner = None
+sniper: Sniper | None = None
+sniper_task: asyncio.Task | None = None
 
 
 def _is_admin(update) -> bool:
@@ -288,6 +292,7 @@ async def cmd_help(update, context):
         lines.append("/buy &lt;address&gt; [amount] — Manual buy")
         lines.append("/sell &lt;address&gt; [percent] — Manual sell")
         lines.append("/info &lt;address&gt; — Token research &amp; safety report")
+        lines.append("/snipe &lt;address&gt; [amount] — Snipe a token on pool creation")
         lines.append("/autotrade on|off — Toggle auto-trading")
         lines.append("/withdraw &lt;amount&gt; &lt;address&gt; — Withdraw SOL")
         lines.append("/export — Export wallet credentials (DM only)")
@@ -313,6 +318,7 @@ async def cmd_help(update, context):
             lines.append("/backtest [days] — Replay scoring strategy against history")
             from config import API_ENABLED, API_PORT
             lines.append(f"\nAPI: {'Enabled on port ' + str(API_PORT) if API_ENABLED else 'Disabled'}")
+            lines.append(f"Sniper: {'Enabled' if SNIPER_ENABLED else 'Disabled'}")
     else:
         uid = update.effective_user.id
         lines.append(f"Your user ID: <code>{uid}</code>")
@@ -345,7 +351,7 @@ async def cmd_start(update, context):
         await update.message.reply_text("Admin only.")
         return
 
-    global is_running, scanner_task, monitor_task, whale_task, daily_report_task
+    global is_running, scanner_task, monitor_task, whale_task, daily_report_task, sniper_task
 
     if is_running:
         await update.message.reply_text("Bot is already running.")
@@ -356,6 +362,8 @@ async def cmd_start(update, context):
     monitor_task = asyncio.create_task(monitor.start())
     if whale_tracker:
         whale_task = asyncio.create_task(whale_tracker.start())
+    if sniper and SNIPER_ENABLED:
+        sniper_task = asyncio.create_task(sniper.start())
     daily_report_task = asyncio.create_task(daily_report_loop())
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
@@ -385,7 +393,7 @@ async def cmd_stop(update, context):
         await update.message.reply_text("Admin only.")
         return
 
-    global is_running, scanner_task, monitor_task, whale_task, daily_report_task
+    global is_running, scanner_task, monitor_task, whale_task, daily_report_task, sniper_task
 
     if not is_running:
         await update.message.reply_text("Bot is not running.")
@@ -396,18 +404,23 @@ async def cmd_stop(update, context):
         await monitor.stop()
     if whale_tracker:
         await whale_tracker.stop()
+    if sniper:
+        await sniper.stop()
     if scanner_task and not scanner_task.done():
         scanner_task.cancel()
     if monitor_task and not monitor_task.done():
         monitor_task.cancel()
     if whale_task and not whale_task.done():
         whale_task.cancel()
+    if sniper_task and not sniper_task.done():
+        sniper_task.cancel()
     if daily_report_task and not daily_report_task.done():
         daily_report_task.cancel()
 
     scanner_task = None
     monitor_task = None
     whale_task = None
+    sniper_task = None
     daily_report_task = None
 
     await update.message.reply_html("🛑 <b>Bot Stopped</b>\nScanning and trading paused. Bot still responds to commands.")
@@ -880,6 +893,7 @@ async def cmd_config(update, context):
         f"Max Buy Amount: {MAX_BUY_AMOUNT} {NATIVE_SYMBOL.get(CHAIN.upper(), 'SOL')}"
         f"\n\n<b>External API</b>\n"
         f"API Server: {'Enabled (port ' + str(API_PORT) + ')' if API_ENABLED else 'Disabled'}"
+        f"\nSniper: {'ON' if SNIPER_ENABLED else 'OFF'} | Check: {SNIPER_CHECK_INTERVAL}s | Min Liq: ${SNIPER_MIN_LIQUIDITY:,}\n"
     )
     await update.message.reply_html(msg)
 
@@ -1201,6 +1215,91 @@ async def cmd_info(update, context):
         msg,
         reply_markup=InlineKeyboardMarkup(keyboard),
         disable_web_page_preview=True,
+    )
+
+
+async def cmd_snipe(update, context):
+    """Sniper: /snipe <address> [amount] | /snipe list | /snipe remove <address>"""
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    if not SNIPER_ENABLED:
+        await update.message.reply_text("⚠️ Sniper mode is disabled. Set SNIPER_ENABLED=true to enable.")
+        return
+
+    user_id = update.effective_user.id
+    args = context.args or []
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+
+    if not args:
+        await update.message.reply_html(
+            "🎯 <b>Sniper Mode</b>\n\n"
+            "Usage:\n"
+            "<code>/snipe &lt;token_address&gt; [amount]</code> — Add to snipe list\n"
+            "<code>/snipe list</code> — Show your snipe targets\n"
+            "<code>/snipe remove &lt;token_address&gt;</code> — Remove from list\n\n"
+            f"Min liquidity: ${SNIPER_MIN_LIQUIDITY:,}\n"
+            f"Check interval: {SNIPER_CHECK_INTERVAL}s"
+        )
+        return
+
+    subcmd = args[0].lower()
+
+    if subcmd == "list":
+        targets = await db.get_user_snipe_targets(user_id)
+        if not targets:
+            await update.message.reply_text("🎯 No active snipe targets.")
+            return
+        lines = ["🎯 <b>Your Snipe Targets</b>\n"]
+        for i, t in enumerate(targets, 1):
+            amt = f"{t['amount']:.4f} {native}" if t["amount"] > 0 else "auto"
+            lines.append(f"{i}. <code>{t['token_address']}</code>\n   Amount: {amt} | Added: {t['added_at']}")
+        await update.message.reply_html("\n".join(lines))
+        return
+
+    if subcmd == "remove":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /snipe remove <token_address>")
+            return
+        addr = args[1].strip()
+        removed = await db.remove_snipe_target(addr, user_id)
+        if removed:
+            await update.message.reply_text(f"✅ Removed from snipe list.")
+        else:
+            await update.message.reply_text(f"❌ Not found in your snipe list.")
+        return
+
+    token_address = args[0].strip()
+    amount = 0.0
+    if len(args) >= 2:
+        try:
+            amount = float(args[1])
+            if amount < 0:
+                await update.message.reply_text("Amount must be positive.")
+                return
+        except ValueError:
+            await update.message.reply_text("Invalid amount.")
+            return
+
+    already = await db.is_token_already_bought(token_address, CHAIN.upper(), user_id)
+    if already:
+        await update.message.reply_text("Already holding this token.")
+        return
+
+    added = await db.add_snipe_target(token_address, user_id, amount)
+    if not added:
+        await update.message.reply_text("Already in your snipe list.")
+        return
+
+    amt_str = f"{amount:.4f} {native}" if amount > 0 else f"auto ({BUY_PERCENT}% of balance)"
+    await update.message.reply_html(
+        f"🎯 <b>Snipe Target Added</b>\n\n"
+        f"Token: <code>{token_address}</code>\n"
+        f"Amount: {amt_str}\n"
+        f"Min Liquidity: ${SNIPER_MIN_LIQUIDITY:,}\n\n"
+        f"The bot will auto-buy when a pool appears with sufficient liquidity.\n"
+        f"Checking every {SNIPER_CHECK_INTERVAL} seconds."
     )
 
 
@@ -1662,7 +1761,7 @@ async def cmd_fees(update, context):
 
 
 async def post_init(application):
-    global trader, monitor, notifier, whale_tracker, alerts_enabled
+    global trader, monitor, notifier, whale_tracker, alerts_enabled, sniper
 
     await db.init_db()
 
@@ -1675,6 +1774,9 @@ async def post_init(application):
 
     if CHAIN.upper() == "SOL" and WHALE_TRACKING_ENABLED:
         whale_tracker = WhaleTracker(trader.client, notifier)
+
+    if SNIPER_ENABLED:
+        sniper = Sniper(notifier)
 
     admin_wallet = await db.get_user_wallet(TELEGRAM_CHAT_ID)
     if not admin_wallet:
@@ -2755,6 +2857,7 @@ def main():
     app.add_handler(CommandHandler("buy", cmd_buy))
     app.add_handler(CommandHandler("sell", cmd_sell))
     app.add_handler(CommandHandler("info", cmd_info))
+    app.add_handler(CommandHandler("snipe", cmd_snipe))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     app.add_handler(CommandHandler("adduser", cmd_adduser))
     app.add_handler(CommandHandler("removeuser", cmd_removeuser))
