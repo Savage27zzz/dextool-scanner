@@ -58,7 +58,7 @@ from fee_collector import collect_fee
 from monitor import ProfitMonitor, _format_duration
 from notifier import Notifier
 from honeypot import check_honeypot
-from scanner import scan_all_sources
+from scanner import scan_all_sources, fetch_token_research
 from trader import create_trader, create_user_trader, _load_solana_keypair, _get_shared_client
 from whale_tracker import WhaleTracker
 from config import WHALE_TRACKING_ENABLED, WHALE_CHECK_INTERVAL, WHALE_MIN_SOL, WHALE_COPY_ENABLED, WHALE_COPY_AMOUNT
@@ -287,6 +287,7 @@ async def cmd_help(update, context):
         lines.append("/config — Current bot configuration")
         lines.append("/buy &lt;address&gt; [amount] — Manual buy")
         lines.append("/sell &lt;address&gt; [percent] — Manual sell")
+        lines.append("/info &lt;address&gt; — Token research &amp; safety report")
         lines.append("/autotrade on|off — Toggle auto-trading")
         lines.append("/withdraw &lt;amount&gt; &lt;address&gt; — Withdraw SOL")
         lines.append("/export — Export wallet credentials (DM only)")
@@ -1109,6 +1110,98 @@ async def cmd_sell(update, context):
         )
 
     logger.info("Manual sell executed: %s (%d%%), user=%d, tx=%s", token_address, sell_percent, user_id, result["tx_hash"])
+
+
+async def cmd_info(update, context):
+    """Token research: /info <token_address>"""
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    if not context.args or len(context.args) < 1:
+        await update.message.reply_html(
+            "Usage: <code>/info &lt;token_address&gt;</code>\n"
+            "Example: <code>/info EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v</code>"
+        )
+        return
+
+    token_address = context.args[0].strip()
+    await update.message.reply_text("\U0001f50d Researching token...")
+
+    async with aiohttp.ClientSession() as session:
+        data = await fetch_token_research(session, CHAIN, token_address)
+
+    if data is None:
+        await update.message.reply_text("\u274c Could not find token data. Check the address and try again.")
+        return
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    hp_icon = "\U0001f6ab HONEYPOT" if data["is_honeypot"] else "\u2705 Safe" if data["honeypot_checked"] else "\u26a0\ufe0f Unknown"
+
+    pc = data["price_change_24h"]
+    pc_icon = "\U0001f7e2" if pc >= 0 else "\U0001f534"
+    pc_str = f"{pc_icon} {pc:+.2f}%" if pc != 0 else "\u2014"
+
+    socials = data.get("social_links", {})
+    social_parts = []
+    social_icons = {"website": "\U0001f310", "twitter": "\U0001f426", "telegram": "\U0001f4ac", "discord": "\U0001f3ae"}
+    for key, icon in social_icons.items():
+        url = socials.get(key, "")
+        if url:
+            social_parts.append(f'<a href="{url}">{icon} {key.title()}</a>')
+    social_str = " | ".join(social_parts) if social_parts else "None found"
+
+    txns = data.get("txns_24h", {})
+    buys = txns.get("buys", 0)
+    sells = txns.get("sells", 0)
+
+    chain_slug = {"SOL": "solana", "ETH": "ether", "BSC": "bsc"}.get(CHAIN.upper(), "solana")
+    dextools_url = f"https://www.dextools.io/app/en/{chain_slug}/pair-explorer/{data.get('pair_address') or token_address}"
+    ds_url = data.get("dexscreener_url") or f"https://dexscreener.com/{chain_slug}/{token_address}"
+
+    msg = (
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001f52c <b>TOKEN INFO</b>\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001fa99 <b>{data['name']}</b> ({data['symbol']})\n"
+        f"\U0001f4c4 <code>{token_address}</code>\n"
+        f"\u26d3 {CHAIN.upper()} | Age: {data['age_str']}\n\n"
+        f"\U0001f4b0 <b>Price:</b> ${data['price_usd']:.8g} ({data['price_native']:.10f} {native})\n"
+        f"\U0001f4ca <b>MCap:</b> ${data['market_cap']:,.0f}\n"
+        f"\U0001f4a7 <b>Liquidity:</b> ${data['liquidity']:,.0f}\n"
+        f"\U0001f4c8 <b>Volume 24h:</b> ${data['volume_24h']:,.0f}\n"
+        f"\U0001f4c9 <b>24h Change:</b> {pc_str}\n"
+        f"\U0001f504 <b>Txns 24h:</b> {buys} buys / {sells} sells\n"
+    )
+
+    if data["holders"] > 0:
+        msg += f"\U0001f465 <b>Holders:</b> {data['holders']:,}\n"
+
+    msg += (
+        f"\n\U0001f6e1 <b>Safety:</b> {hp_icon}\n"
+        f"\U0001f4b8 <b>Tax:</b> Buy {data['buy_tax']:.1f}% / Sell {data['sell_tax']:.1f}%\n"
+        f"\u2b50 <b>Score:</b> {data['score_bar']}\n"
+        f"\n\U0001f517 {social_str}\n"
+        f'\n<a href="{dextools_url}">\U0001f4ca DexTools</a> | <a href="{ds_url}">\U0001f4ca DexScreener</a>\n'
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+    )
+
+    tp = token_address[:16]
+    keyboard = [
+        [
+            InlineKeyboardButton("\U0001f6d2 Buy 0.1 SOL", callback_data=f"quickbuy:{tp}:0.1"),
+            InlineKeyboardButton("\U0001f6d2 Buy 0.5 SOL", callback_data=f"quickbuy:{tp}:0.5"),
+        ],
+        [
+            InlineKeyboardButton("\U0001f504 Refresh", callback_data=f"info_refresh:{token_address}"),
+        ],
+    ]
+
+    await update.message.reply_html(
+        msg,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True,
+    )
 
 
 async def cmd_portfolio(update, context):
@@ -2320,6 +2413,72 @@ async def handle_callback(update, context):
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
 
+        elif data.startswith("info_refresh:"):
+            token_address = data.split(":", 1)[1]
+            await query.edit_message_text("\U0001f50d Refreshing...")
+            async with aiohttp.ClientSession() as session:
+                info_data = await fetch_token_research(session, CHAIN, token_address)
+            if info_data is None:
+                await query.edit_message_text("\u274c Could not refresh token data.")
+                return
+            native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+            hp_icon = "\U0001f6ab HONEYPOT" if info_data["is_honeypot"] else "\u2705 Safe" if info_data["honeypot_checked"] else "\u26a0\ufe0f Unknown"
+            pc = info_data["price_change_24h"]
+            pc_icon = "\U0001f7e2" if pc >= 0 else "\U0001f534"
+            pc_str = f"{pc_icon} {pc:+.2f}%" if pc != 0 else "\u2014"
+            socials = info_data.get("social_links", {})
+            social_parts = []
+            social_icons = {"website": "\U0001f310", "twitter": "\U0001f426", "telegram": "\U0001f4ac", "discord": "\U0001f3ae"}
+            for key, icon in social_icons.items():
+                url = socials.get(key, "")
+                if url:
+                    social_parts.append(f'<a href="{url}">{icon} {key.title()}</a>')
+            social_str = " | ".join(social_parts) if social_parts else "None found"
+            txns = info_data.get("txns_24h", {})
+            buys_count = txns.get("buys", 0)
+            sells_count = txns.get("sells", 0)
+            chain_slug = {"SOL": "solana", "ETH": "ether", "BSC": "bsc"}.get(CHAIN.upper(), "solana")
+            dextools_url = f"https://www.dextools.io/app/en/{chain_slug}/pair-explorer/{info_data.get('pair_address') or token_address}"
+            ds_url = info_data.get("dexscreener_url") or f"https://dexscreener.com/{chain_slug}/{token_address}"
+            msg = (
+                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                f"\U0001f52c <b>TOKEN INFO</b>\n"
+                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                f"\U0001fa99 <b>{info_data['name']}</b> ({info_data['symbol']})\n"
+                f"\U0001f4c4 <code>{token_address}</code>\n"
+                f"\u26d3 {CHAIN.upper()} | Age: {info_data['age_str']}\n\n"
+                f"\U0001f4b0 <b>Price:</b> ${info_data['price_usd']:.8g} ({info_data['price_native']:.10f} {native})\n"
+                f"\U0001f4ca <b>MCap:</b> ${info_data['market_cap']:,.0f}\n"
+                f"\U0001f4a7 <b>Liquidity:</b> ${info_data['liquidity']:,.0f}\n"
+                f"\U0001f4c8 <b>Volume 24h:</b> ${info_data['volume_24h']:,.0f}\n"
+                f"\U0001f4c9 <b>24h Change:</b> {pc_str}\n"
+                f"\U0001f504 <b>Txns 24h:</b> {buys_count} buys / {sells_count} sells\n"
+            )
+            if info_data["holders"] > 0:
+                msg += f"\U0001f465 <b>Holders:</b> {info_data['holders']:,}\n"
+            msg += (
+                f"\n\U0001f6e1 <b>Safety:</b> {hp_icon}\n"
+                f"\U0001f4b8 <b>Tax:</b> Buy {info_data['buy_tax']:.1f}% / Sell {info_data['sell_tax']:.1f}%\n"
+                f"\u2b50 <b>Score:</b> {info_data['score_bar']}\n"
+                f"\n\U0001f517 {social_str}\n"
+                f'\n<a href="{dextools_url}">\U0001f4ca DexTools</a> | <a href="{ds_url}">\U0001f4ca DexScreener</a>\n'
+                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+            )
+            tp = token_address[:16]
+            keyboard = [
+                [
+                    InlineKeyboardButton("\U0001f6d2 Buy 0.1 SOL", callback_data=f"quickbuy:{tp}:0.1"),
+                    InlineKeyboardButton("\U0001f6d2 Buy 0.5 SOL", callback_data=f"quickbuy:{tp}:0.5"),
+                ],
+                [
+                    InlineKeyboardButton("\U0001f504 Refresh", callback_data=f"info_refresh:{token_address}"),
+                ],
+            ]
+            await query.edit_message_text(
+                msg, parse_mode="HTML", disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+
         elif data.startswith("quickbuy:"):
             parts = data.split(":")
             if len(parts) == 3:
@@ -2595,6 +2754,7 @@ def main():
     app.add_handler(CommandHandler("config", cmd_config))
     app.add_handler(CommandHandler("buy", cmd_buy))
     app.add_handler(CommandHandler("sell", cmd_sell))
+    app.add_handler(CommandHandler("info", cmd_info))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     app.add_handler(CommandHandler("adduser", cmd_adduser))
     app.add_handler(CommandHandler("removeuser", cmd_removeuser))
