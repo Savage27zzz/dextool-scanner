@@ -9,7 +9,7 @@ import aiohttp
 import base58
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Confirmed
-from solana.rpc.types import TxOpts
+from solana.rpc.types import TxOpts, TokenAccountOpts
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 
@@ -206,7 +206,7 @@ class SolanaTrader:
 
             resp = await self.client.get_token_accounts_by_owner_json_parsed(
                 owner,
-                opts={"mint": mint_pubkey},
+                TokenAccountOpts(mint=mint_pubkey),
             )
 
             if resp.value:
