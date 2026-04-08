@@ -34,8 +34,8 @@ def _get_shared_client() -> AsyncClient:
         _shared_client = AsyncClient(RPC_URL_SOL, commitment=Confirmed)
     return _shared_client
 
-JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
+JUPITER_QUOTE_URL = "https://api.jup.ag/swap/v1/quote"
+JUPITER_SWAP_URL = "https://api.jup.ag/swap/v1/swap"
 JUPITER_PRICE_URL = "https://api.jup.ag/price/v2"
 
 SOLSCAN_TX_URL = "https://solscan.io/tx/"
