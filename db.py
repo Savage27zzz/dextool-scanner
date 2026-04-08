@@ -213,6 +213,43 @@ CREATE TABLE IF NOT EXISTS token_whitelist (
 );
 """
 
+_CREATE_DCA_ORDERS = """
+CREATE TABLE IF NOT EXISTS dca_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    token_address TEXT NOT NULL,
+    token_symbol TEXT DEFAULT '',
+    chain TEXT NOT NULL DEFAULT 'SOL',
+    total_amount REAL NOT NULL,
+    amount_per_buy REAL NOT NULL,
+    splits_total INTEGER NOT NULL,
+    splits_done INTEGER DEFAULT 0,
+    interval_seconds INTEGER NOT NULL,
+    status TEXT DEFAULT 'active',
+    last_buy_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, token_address, chain, status)
+);
+"""
+
+_CREATE_LIMIT_ORDERS = """
+CREATE TABLE IF NOT EXISTS limit_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    token_address TEXT NOT NULL,
+    token_symbol TEXT DEFAULT '',
+    chain TEXT NOT NULL DEFAULT 'SOL',
+    side TEXT NOT NULL,
+    amount REAL NOT NULL,
+    target_price REAL NOT NULL,
+    condition TEXT NOT NULL DEFAULT 'lte',
+    status TEXT DEFAULT 'active',
+    fill_tx_hash TEXT DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    filled_at TIMESTAMP
+);
+"""
+
 
 async def _conn() -> aiosqlite.Connection:
     db = await aiosqlite.connect(str(DB_PATH))
@@ -239,6 +276,8 @@ async def init_db():
         await db.execute(_CREATE_USER_SETTINGS)
         await db.execute(_CREATE_TOKEN_BLACKLIST)
         await db.execute(_CREATE_TOKEN_WHITELIST)
+        await db.execute(_CREATE_DCA_ORDERS)
+        await db.execute(_CREATE_LIMIT_ORDERS)
         try:
             await db.execute("ALTER TABLE open_positions ADD COLUMN peak_price REAL DEFAULT 0")
         except Exception:
@@ -1279,6 +1318,137 @@ async def get_whitelist() -> list[dict]:
         cursor = await conn.execute("SELECT * FROM token_whitelist ORDER BY added_at DESC")
         rows = await cursor.fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# DCA orders
+# ---------------------------------------------------------------------------
+
+async def create_dca_order(user_id: int, token_address: str, token_symbol: str, chain: str,
+                           total_amount: float, splits: int, interval_seconds: int) -> int | None:
+    amount_per = total_amount / splits
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        try:
+            cursor = await conn.execute(
+                "INSERT INTO dca_orders (user_id, token_address, token_symbol, chain, "
+                "total_amount, amount_per_buy, splits_total, interval_seconds) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (user_id, token_address, token_symbol, chain, total_amount, amount_per, splits, interval_seconds),
+            )
+            await conn.commit()
+            return cursor.lastrowid
+        except Exception as exc:
+            logger.error("create_dca_order error: %s", exc)
+            return None
+
+
+async def get_active_dca_orders() -> list[dict]:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM dca_orders WHERE status = 'active' AND splits_done < splits_total "
+            "AND (last_buy_at IS NULL OR last_buy_at <= datetime('now', '-' || interval_seconds || ' seconds'))"
+        )
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_user_dca_orders(user_id: int) -> list[dict]:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM dca_orders WHERE user_id = ? AND status = 'active' ORDER BY created_at DESC",
+            (user_id,),
+        )
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def advance_dca_order(order_id: int) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        await conn.execute(
+            "UPDATE dca_orders SET splits_done = splits_done + 1, last_buy_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (order_id,),
+        )
+        cursor = await conn.execute(
+            "SELECT splits_done, splits_total FROM dca_orders WHERE id = ?", (order_id,)
+        )
+        row = await cursor.fetchone()
+        if row and row[0] >= row[1]:
+            await conn.execute("UPDATE dca_orders SET status = 'completed' WHERE id = ?", (order_id,))
+        await conn.commit()
+    return True
+
+
+async def cancel_dca_order(order_id: int, user_id: int) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        cursor = await conn.execute(
+            "UPDATE dca_orders SET status = 'cancelled' WHERE id = ? AND user_id = ? AND status = 'active'",
+            (order_id, user_id),
+        )
+        await conn.commit()
+    return cursor.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Limit orders
+# ---------------------------------------------------------------------------
+
+async def create_limit_order(user_id: int, token_address: str, token_symbol: str, chain: str,
+                             side: str, amount: float, target_price: float) -> int | None:
+    condition = "lte" if side == "buy" else "gte"
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        try:
+            cursor = await conn.execute(
+                "INSERT INTO limit_orders (user_id, token_address, token_symbol, chain, "
+                "side, amount, target_price, condition) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (user_id, token_address, token_symbol, chain, side, amount, target_price, condition),
+            )
+            await conn.commit()
+            return cursor.lastrowid
+        except Exception as exc:
+            logger.error("create_limit_order error: %s", exc)
+            return None
+
+
+async def get_active_limit_orders() -> list[dict]:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM limit_orders WHERE status = 'active'"
+        )
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_user_limit_orders(user_id: int) -> list[dict]:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM limit_orders WHERE user_id = ? AND status = 'active' ORDER BY created_at DESC",
+            (user_id,),
+        )
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def fill_limit_order(order_id: int, tx_hash: str):
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        await conn.execute(
+            "UPDATE limit_orders SET status = 'filled', fill_tx_hash = ?, filled_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (tx_hash, order_id),
+        )
+        await conn.commit()
+
+
+async def cancel_limit_order(order_id: int, user_id: int) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        cursor = await conn.execute(
+            "UPDATE limit_orders SET status = 'cancelled' WHERE id = ? AND user_id = ? AND status = 'active'",
+            (order_id, user_id),
+        )
+        await conn.commit()
+    return cursor.rowcount > 0
 
 
 async def get_effective_config(user_id: int) -> dict:

@@ -80,6 +80,8 @@ _pending_buys: dict[str, str] = {}
 api_runner = None
 sniper: Sniper | None = None
 sniper_task: asyncio.Task | None = None
+dca_task: asyncio.Task | None = None
+limit_order_task: asyncio.Task | None = None
 
 
 def _is_admin(update) -> bool:
@@ -372,6 +374,11 @@ async def cmd_help(update, context):
             lines.append("/backtest [days] — Replay scoring strategy against history")
             lines.append("/blacklist — Manage token blacklist")
             lines.append("/whitelist — Manage token whitelist")
+            lines.append("")
+            lines.append("<b>📊 Trading:</b>")
+            lines.append("/dca — Dollar cost averaging (split buys)")
+            lines.append("/limit — Limit orders (buy/sell at price)")
+            lines.append("/orders — View all active orders")
             from config import API_ENABLED, API_PORT
             lines.append(f"\nAPI: {'Enabled on port ' + str(API_PORT) if API_ENABLED else 'Disabled'}")
             lines.append(f"Sniper: {'Enabled' if SNIPER_ENABLED else 'Disabled'}")
@@ -407,7 +414,7 @@ async def cmd_start(update, context):
         await update.message.reply_text("Admin only.")
         return
 
-    global is_running, scanner_task, monitor_task, whale_task, daily_report_task, sniper_task
+    global is_running, scanner_task, monitor_task, whale_task, daily_report_task, sniper_task, dca_task, limit_order_task
 
     if is_running:
         await update.message.reply_text("Bot is already running.")
@@ -421,6 +428,8 @@ async def cmd_start(update, context):
     if sniper and SNIPER_ENABLED:
         sniper_task = asyncio.create_task(sniper.start())
     daily_report_task = asyncio.create_task(daily_report_loop())
+    dca_task = asyncio.create_task(dca_loop())
+    limit_order_task = asyncio.create_task(limit_order_loop())
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
     if CHAIN.upper() == "SOL":
@@ -449,7 +458,7 @@ async def cmd_stop(update, context):
         await update.message.reply_text("Admin only.")
         return
 
-    global is_running, scanner_task, monitor_task, whale_task, daily_report_task, sniper_task
+    global is_running, scanner_task, monitor_task, whale_task, daily_report_task, sniper_task, dca_task, limit_order_task
 
     if not is_running:
         await update.message.reply_text("Bot is not running.")
@@ -472,12 +481,18 @@ async def cmd_stop(update, context):
         sniper_task.cancel()
     if daily_report_task and not daily_report_task.done():
         daily_report_task.cancel()
+    if dca_task and not dca_task.done():
+        dca_task.cancel()
+    if limit_order_task and not limit_order_task.done():
+        limit_order_task.cancel()
 
     scanner_task = None
     monitor_task = None
     whale_task = None
     sniper_task = None
     daily_report_task = None
+    dca_task = None
+    limit_order_task = None
 
     await update.message.reply_html("🛑 <b>Bot Stopped</b>\nScanning and trading paused. Bot still responds to commands.")
     logger.info("Bot stopped by user %s", update.effective_user.id)
@@ -1976,7 +1991,7 @@ async def post_init(application):
 
 
 async def shutdown(application):
-    global is_running, api_runner
+    global is_running, api_runner, dca_task, limit_order_task
     is_running = False
     await stop_api_server(api_runner)
     api_runner = None
@@ -1984,6 +1999,12 @@ async def shutdown(application):
         await whale_tracker.stop()
     if monitor:
         await monitor.stop()
+    if dca_task and not dca_task.done():
+        dca_task.cancel()
+    if limit_order_task and not limit_order_task.done():
+        limit_order_task.cancel()
+    dca_task = None
+    limit_order_task = None
     if trader:
         await trader.close()
     logger.info("Shutdown complete")
@@ -3140,6 +3161,416 @@ async def cmd_sellall(update, context):
     )
 
 
+# ---------------------------------------------------------------------------
+# DCA background loop
+# ---------------------------------------------------------------------------
+
+async def dca_loop():
+    global is_running
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    logger.info("DCA loop started")
+
+    while is_running:
+        try:
+            due_orders = await db.get_active_dca_orders()
+            for order in due_orders:
+                if not is_running:
+                    break
+                try:
+                    uid = order["user_id"]
+                    token_addr = order["token_address"]
+                    amount = order["amount_per_buy"]
+
+                    user_trader = await create_user_trader(uid)
+                    if user_trader is None:
+                        continue
+
+                    balance = await user_trader.get_balance()
+                    if balance < amount + 0.005:
+                        await notifier.send_to_user(uid, f"⚠️ DCA #{order['id']}: insufficient balance ({balance:.4f} {native})")
+                        continue
+
+                    logger.info("DCA buy #%d: %s for user %d (%.4f %s, split %d/%d)",
+                                order["id"], token_addr[:12], uid, amount, native,
+                                order["splits_done"] + 1, order["splits_total"])
+
+                    result = await user_trader.buy_token(token_addr, amount)
+                    if result:
+                        existing = await db.is_token_already_bought(token_addr, CHAIN.upper(), uid)
+                        if not existing:
+                            position = {
+                                "token_address": token_addr,
+                                "token_symbol": order.get("token_symbol", token_addr[:8]),
+                                "chain": CHAIN.upper(),
+                                "entry_price": result["entry_price"],
+                                "tokens_received": result["tokens_received"],
+                                "buy_amount_native": result["amount_spent"],
+                                "buy_tx_hash": result["tx_hash"],
+                                "pair_address": "",
+                                "entry_liquidity": 0,
+                                "user_id": uid,
+                            }
+                            await db.save_open_position(position)
+
+                        await db.advance_dca_order(order["id"])
+
+                        remaining = order["splits_total"] - order["splits_done"] - 1
+                        await notifier.send_to_user(
+                            uid,
+                            f"📊 DCA #{order['id']} buy {order['splits_done']+1}/{order['splits_total']}: "
+                            f"{amount:.4f} {native} → {order.get('token_symbol', token_addr[:8])}\n"
+                            f"{'✅ DCA complete!' if remaining == 0 else f'{remaining} buys remaining'}"
+                        )
+                    else:
+                        await notifier.send_to_user(uid, f"❌ DCA #{order['id']} buy failed. Will retry next interval.")
+
+                except Exception as exc:
+                    logger.error("DCA order #%d error: %s", order.get("id", 0), exc)
+
+        except Exception as exc:
+            logger.error("DCA loop error: %s", exc)
+
+        await asyncio.sleep(30)
+
+
+# ---------------------------------------------------------------------------
+# Limit order background loop
+# ---------------------------------------------------------------------------
+
+async def limit_order_loop():
+    global is_running
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    logger.info("Limit order loop started")
+
+    while is_running:
+        try:
+            orders = await db.get_active_limit_orders()
+            for order in orders:
+                if not is_running:
+                    break
+                try:
+                    token_addr = order["token_address"]
+                    uid = order["user_id"]
+
+                    current_price = await trader.get_token_price_via_jupiter(token_addr)
+                    if current_price <= 0:
+                        continue
+
+                    target = order["target_price"]
+                    triggered = False
+
+                    if order["side"] == "buy" and current_price <= target:
+                        triggered = True
+                    elif order["side"] == "sell" and current_price >= target:
+                        triggered = True
+
+                    if not triggered:
+                        continue
+
+                    user_trader = await create_user_trader(uid)
+                    if user_trader is None:
+                        continue
+
+                    if order["side"] == "buy":
+                        amount = order["amount"]
+                        result = await user_trader.buy_token(token_addr, amount)
+                        if result:
+                            existing = await db.is_token_already_bought(token_addr, CHAIN.upper(), uid)
+                            if not existing:
+                                position = {
+                                    "token_address": token_addr,
+                                    "token_symbol": order.get("token_symbol", token_addr[:8]),
+                                    "chain": CHAIN.upper(),
+                                    "entry_price": result["entry_price"],
+                                    "tokens_received": result["tokens_received"],
+                                    "buy_amount_native": result["amount_spent"],
+                                    "buy_tx_hash": result["tx_hash"],
+                                    "pair_address": "",
+                                    "entry_liquidity": 0,
+                                    "user_id": uid,
+                                }
+                                await db.save_open_position(position)
+
+                            await db.fill_limit_order(order["id"], result["tx_hash"])
+                            await notifier.send_to_user(
+                                uid,
+                                f"📋 Limit BUY filled! #{order['id']}\n"
+                                f"{order.get('token_symbol', token_addr[:8])} @ {current_price:.10f} {native}\n"
+                                f"Spent: {amount:.4f} {native}"
+                            )
+
+                    elif order["side"] == "sell":
+                        sell_pct = order["amount"]
+                        ui_balance, decimals = await user_trader.get_token_balance(token_addr)
+                        if ui_balance <= 0:
+                            continue
+                        sell_ui = ui_balance * (sell_pct / 100)
+                        sell_raw = int(sell_ui * (10 ** decimals)) if decimals > 0 else int(sell_ui * 1e9)
+
+                        if sell_raw <= 0:
+                            continue
+
+                        result = await user_trader.sell_token(token_addr, sell_raw, decimals)
+                        if result:
+                            await db.fill_limit_order(order["id"], result["tx_hash"])
+
+                            if sell_pct == 100:
+                                positions = await db.get_open_positions(user_id=uid)
+                                for pos in positions:
+                                    if pos["token_address"].lower() == token_addr.lower():
+                                        entry_price = pos["entry_price"]
+                                        roi = ((result["exit_price"] - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+                                        exit_data = {
+                                            "exit_price": result["exit_price"],
+                                            "sell_amount_native": result["native_received"],
+                                            "profit_usd": None,
+                                            "roi_percent": roi,
+                                            "sell_tx_hash": result["tx_hash"],
+                                            "duration_seconds": 0,
+                                        }
+                                        await db.close_position(token_addr, CHAIN.upper(), exit_data, user_id=uid)
+                                        break
+
+                            await notifier.send_to_user(
+                                uid,
+                                f"📋 Limit SELL filled! #{order['id']}\n"
+                                f"{order.get('token_symbol', token_addr[:8])} @ {current_price:.10f} {native}\n"
+                                f"Received: {result['native_received']:.6f} {native}"
+                            )
+
+                except Exception as exc:
+                    logger.error("Limit order #%d error: %s", order.get("id", 0), exc)
+
+        except Exception as exc:
+            logger.error("Limit order loop error: %s", exc)
+
+        await asyncio.sleep(15)
+
+
+# ---------------------------------------------------------------------------
+# /dca command
+# ---------------------------------------------------------------------------
+
+async def cmd_dca(update, context):
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    user_id = update.effective_user.id
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+
+    if not context.args:
+        await update.message.reply_html(
+            "📊 <b>DCA Mode</b>\n\n"
+            "Usage: <code>/dca &lt;token&gt; &lt;total_sol&gt; &lt;splits&gt; &lt;interval_min&gt;</code>\n"
+            "Example: <code>/dca EPjF...1v 0.3 3 5</code>\n"
+            "(Buy 0.3 SOL in 3 orders, 5min apart)\n\n"
+            "<code>/dca list</code> — view active orders\n"
+            "<code>/dca cancel &lt;id&gt;</code> — cancel order"
+        )
+        return
+
+    if context.args[0].lower() == "list":
+        orders = await db.get_user_dca_orders(user_id)
+        if not orders:
+            await update.message.reply_text("No active DCA orders.")
+            return
+        lines = ["📊 <b>Active DCA Orders</b>\n"]
+        for o in orders:
+            lines.append(
+                f"#{o['id']} {o['token_symbol']} — "
+                f"{o['splits_done']}/{o['splits_total']} buys "
+                f"({o['amount_per_buy']:.4f} {native} each, "
+                f"every {o['interval_seconds']//60}min)"
+            )
+        await update.message.reply_html("\n".join(lines))
+        return
+
+    if context.args[0].lower() == "cancel":
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: /dca cancel <order_id>")
+            return
+        order_id = int(context.args[1])
+        cancelled = await db.cancel_dca_order(order_id, user_id)
+        await update.message.reply_text("✅ DCA order cancelled." if cancelled else "❌ Order not found or not yours.")
+        return
+
+    if len(context.args) < 4:
+        await update.message.reply_text("Usage: /dca <token> <total_sol> <splits> <interval_min>")
+        return
+
+    token_address = context.args[0]
+    try:
+        total_amount = float(context.args[1])
+        splits = int(context.args[2])
+        interval_min = int(context.args[3])
+    except ValueError:
+        await update.message.reply_text("Invalid numbers. Check your input.")
+        return
+
+    if total_amount <= 0 or splits < 2 or splits > 20 or interval_min < 1 or interval_min > 1440:
+        await update.message.reply_text("Limits: amount > 0, splits 2-20, interval 1-1440 min")
+        return
+
+    amount_per = total_amount / splits
+
+    user_trader = await create_user_trader(user_id)
+    if user_trader is None:
+        await update.message.reply_text("No wallet found.")
+        return
+
+    order_id = await db.create_dca_order(
+        user_id=user_id,
+        token_address=token_address,
+        token_symbol=token_address[:8],
+        chain=CHAIN.upper(),
+        total_amount=total_amount,
+        splits=splits,
+        interval_seconds=interval_min * 60,
+    )
+
+    if order_id:
+        await update.message.reply_html(
+            f"📊 <b>DCA Order Created</b> (#{order_id})\n"
+            f"Token: <code>{token_address}</code>\n"
+            f"Total: {total_amount:.4f} {native}\n"
+            f"Splits: {splits} × {amount_per:.4f} {native}\n"
+            f"Interval: every {interval_min} min\n"
+            f"First buy starts immediately."
+        )
+    else:
+        await update.message.reply_text("❌ Failed to create DCA order.")
+
+
+# ---------------------------------------------------------------------------
+# /limit command
+# ---------------------------------------------------------------------------
+
+async def cmd_limit(update, context):
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    user_id = update.effective_user.id
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+
+    if not context.args:
+        await update.message.reply_html(
+            "📋 <b>Limit Orders</b>\n\n"
+            "Buy: <code>/limit buy &lt;token&gt; &lt;sol&gt; &lt;price&gt;</code>\n"
+            "Sell: <code>/limit sell &lt;token&gt; &lt;percent&gt; &lt;price&gt;</code>\n"
+            "List: <code>/limit list</code>\n"
+            "Cancel: <code>/limit cancel &lt;id&gt;</code>\n\n"
+            "Price is in SOL per token."
+        )
+        return
+
+    subcmd = context.args[0].lower()
+
+    if subcmd == "list":
+        orders = await db.get_user_limit_orders(user_id)
+        if not orders:
+            await update.message.reply_text("No active limit orders.")
+            return
+        lines = ["📋 <b>Active Limit Orders</b>\n"]
+        for o in orders:
+            side_emoji = "🟢" if o["side"] == "buy" else "🔴"
+            amount_str = f"{o['amount']:.4f} {native}" if o["side"] == "buy" else f"{o['amount']:.0f}%"
+            lines.append(
+                f"{side_emoji} #{o['id']} {o['side'].upper()} {o.get('token_symbol', o['token_address'][:8])} "
+                f"— {amount_str} @ {o['target_price']:.10f} {native}"
+            )
+        await update.message.reply_html("\n".join(lines))
+        return
+
+    if subcmd == "cancel":
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: /limit cancel <order_id>")
+            return
+        order_id = int(context.args[1])
+        cancelled = await db.cancel_limit_order(order_id, user_id)
+        await update.message.reply_text("✅ Limit order cancelled." if cancelled else "❌ Order not found or not yours.")
+        return
+
+    if subcmd in ("buy", "sell"):
+        if len(context.args) < 4:
+            await update.message.reply_text(f"Usage: /limit {subcmd} <token> <amount> <price>")
+            return
+
+        token_address = context.args[1]
+        try:
+            amount = float(context.args[2])
+            target_price = float(context.args[3])
+        except ValueError:
+            await update.message.reply_text("Invalid numbers.")
+            return
+
+        if amount <= 0 or target_price <= 0:
+            await update.message.reply_text("Amount and price must be positive.")
+            return
+
+        if subcmd == "sell" and (amount < 1 or amount > 100):
+            await update.message.reply_text("Sell percent must be 1-100.")
+            return
+
+        order_id = await db.create_limit_order(
+            user_id=user_id,
+            token_address=token_address,
+            token_symbol=token_address[:8],
+            chain=CHAIN.upper(),
+            side=subcmd,
+            amount=amount,
+            target_price=target_price,
+        )
+
+        if order_id:
+            side_label = f"Buy {amount:.4f} {native}" if subcmd == "buy" else f"Sell {amount:.0f}%"
+            await update.message.reply_html(
+                f"📋 <b>Limit Order Created</b> (#{order_id})\n"
+                f"Side: {subcmd.upper()}\n"
+                f"Token: <code>{token_address}</code>\n"
+                f"{side_label} @ {target_price:.10f} {native}/token"
+            )
+        else:
+            await update.message.reply_text("❌ Failed to create limit order.")
+        return
+
+    await update.message.reply_text("Unknown subcommand. Use buy, sell, list, or cancel.")
+
+
+# ---------------------------------------------------------------------------
+# /orders command — unified view
+# ---------------------------------------------------------------------------
+
+async def cmd_orders(update, context):
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+    user_id = update.effective_user.id
+    dca_orders = await db.get_user_dca_orders(user_id)
+    limit_orders = await db.get_user_limit_orders(user_id)
+
+    if not dca_orders and not limit_orders:
+        await update.message.reply_text("No active orders.")
+        return
+
+    lines = ["📋 <b>Your Active Orders</b>\n"]
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+
+    if dca_orders:
+        lines.append("<b>DCA Orders:</b>")
+        for o in dca_orders:
+            lines.append(f"  📊 #{o['id']} {o.get('token_symbol', '?')} — {o['splits_done']}/{o['splits_total']} ({o['amount_per_buy']:.4f} {native}/buy)")
+
+    if limit_orders:
+        lines.append("\n<b>Limit Orders:</b>")
+        for o in limit_orders:
+            side_emoji = "🟢" if o["side"] == "buy" else "🔴"
+            lines.append(f"  {side_emoji} #{o['id']} {o['side'].upper()} {o.get('token_symbol', '?')} @ {o['target_price']:.10f}")
+
+    await update.message.reply_html("\n".join(lines))
+
+
 def main():
     logger.info("Starting DexTool Scanner Bot …")
 
@@ -3184,6 +3615,9 @@ def main():
     app.add_handler(CommandHandler("blacklist", cmd_blacklist))
     app.add_handler(CommandHandler("whitelist", cmd_whitelist))
     app.add_handler(CommandHandler("sellall", cmd_sellall))
+    app.add_handler(CommandHandler("dca", cmd_dca))
+    app.add_handler(CommandHandler("limit", cmd_limit))
+    app.add_handler(CommandHandler("orders", cmd_orders))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     def _handle_signal(signum, frame):
