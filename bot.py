@@ -58,11 +58,13 @@ from fee_collector import collect_fee
 from monitor import ProfitMonitor, _format_duration
 from notifier import Notifier
 from honeypot import check_honeypot
-from scanner import scan_all_sources
+from scanner import scan_all_sources, fetch_token_research
 from trader import create_trader, create_user_trader, _load_solana_keypair, _get_shared_client
 from whale_tracker import WhaleTracker
 from config import WHALE_TRACKING_ENABLED, WHALE_CHECK_INTERVAL, WHALE_MIN_SOL, WHALE_COPY_ENABLED, WHALE_COPY_AMOUNT
 from api import start_api_server, stop_api_server
+from config import SNIPER_ENABLED, SNIPER_CHECK_INTERVAL, SNIPER_MIN_LIQUIDITY
+from sniper import Sniper
 
 trader = None
 monitor: ProfitMonitor | None = None
@@ -76,6 +78,8 @@ is_running: bool = False
 alerts_enabled: bool = False
 _pending_buys: dict[str, str] = {}
 api_runner = None
+sniper: Sniper | None = None
+sniper_task: asyncio.Task | None = None
 
 
 def _is_admin(update) -> bool:
@@ -287,6 +291,8 @@ async def cmd_help(update, context):
         lines.append("/config — Current bot configuration")
         lines.append("/buy &lt;address&gt; [amount] — Manual buy")
         lines.append("/sell &lt;address&gt; [percent] — Manual sell")
+        lines.append("/info &lt;address&gt; — Token research &amp; safety report")
+        lines.append("/snipe &lt;address&gt; [amount] — Snipe a token on pool creation")
         lines.append("/autotrade on|off — Toggle auto-trading")
         lines.append("/withdraw &lt;amount&gt; &lt;address&gt; — Withdraw SOL")
         lines.append("/export — Export wallet credentials (DM only)")
@@ -312,6 +318,7 @@ async def cmd_help(update, context):
             lines.append("/backtest [days] — Replay scoring strategy against history")
             from config import API_ENABLED, API_PORT
             lines.append(f"\nAPI: {'Enabled on port ' + str(API_PORT) if API_ENABLED else 'Disabled'}")
+            lines.append(f"Sniper: {'Enabled' if SNIPER_ENABLED else 'Disabled'}")
     else:
         uid = update.effective_user.id
         lines.append(f"Your user ID: <code>{uid}</code>")
@@ -344,7 +351,7 @@ async def cmd_start(update, context):
         await update.message.reply_text("Admin only.")
         return
 
-    global is_running, scanner_task, monitor_task, whale_task, daily_report_task
+    global is_running, scanner_task, monitor_task, whale_task, daily_report_task, sniper_task
 
     if is_running:
         await update.message.reply_text("Bot is already running.")
@@ -355,6 +362,8 @@ async def cmd_start(update, context):
     monitor_task = asyncio.create_task(monitor.start())
     if whale_tracker:
         whale_task = asyncio.create_task(whale_tracker.start())
+    if sniper and SNIPER_ENABLED:
+        sniper_task = asyncio.create_task(sniper.start())
     daily_report_task = asyncio.create_task(daily_report_loop())
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
@@ -384,7 +393,7 @@ async def cmd_stop(update, context):
         await update.message.reply_text("Admin only.")
         return
 
-    global is_running, scanner_task, monitor_task, whale_task, daily_report_task
+    global is_running, scanner_task, monitor_task, whale_task, daily_report_task, sniper_task
 
     if not is_running:
         await update.message.reply_text("Bot is not running.")
@@ -395,18 +404,23 @@ async def cmd_stop(update, context):
         await monitor.stop()
     if whale_tracker:
         await whale_tracker.stop()
+    if sniper:
+        await sniper.stop()
     if scanner_task and not scanner_task.done():
         scanner_task.cancel()
     if monitor_task and not monitor_task.done():
         monitor_task.cancel()
     if whale_task and not whale_task.done():
         whale_task.cancel()
+    if sniper_task and not sniper_task.done():
+        sniper_task.cancel()
     if daily_report_task and not daily_report_task.done():
         daily_report_task.cancel()
 
     scanner_task = None
     monitor_task = None
     whale_task = None
+    sniper_task = None
     daily_report_task = None
 
     await update.message.reply_html("🛑 <b>Bot Stopped</b>\nScanning and trading paused. Bot still responds to commands.")
@@ -879,6 +893,7 @@ async def cmd_config(update, context):
         f"Max Buy Amount: {MAX_BUY_AMOUNT} {NATIVE_SYMBOL.get(CHAIN.upper(), 'SOL')}"
         f"\n\n<b>External API</b>\n"
         f"API Server: {'Enabled (port ' + str(API_PORT) + ')' if API_ENABLED else 'Disabled'}"
+        f"\nSniper: {'ON' if SNIPER_ENABLED else 'OFF'} | Check: {SNIPER_CHECK_INTERVAL}s | Min Liq: ${SNIPER_MIN_LIQUIDITY:,}\n"
     )
     await update.message.reply_html(msg)
 
@@ -1109,6 +1124,183 @@ async def cmd_sell(update, context):
         )
 
     logger.info("Manual sell executed: %s (%d%%), user=%d, tx=%s", token_address, sell_percent, user_id, result["tx_hash"])
+
+
+async def cmd_info(update, context):
+    """Token research: /info <token_address>"""
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    if not context.args or len(context.args) < 1:
+        await update.message.reply_html(
+            "Usage: <code>/info &lt;token_address&gt;</code>\n"
+            "Example: <code>/info EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v</code>"
+        )
+        return
+
+    token_address = context.args[0].strip()
+    await update.message.reply_text("\U0001f50d Researching token...")
+
+    async with aiohttp.ClientSession() as session:
+        data = await fetch_token_research(session, CHAIN, token_address)
+
+    if data is None:
+        await update.message.reply_text("\u274c Could not find token data. Check the address and try again.")
+        return
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    hp_icon = "\U0001f6ab HONEYPOT" if data["is_honeypot"] else "\u2705 Safe" if data["honeypot_checked"] else "\u26a0\ufe0f Unknown"
+
+    pc = data["price_change_24h"]
+    pc_icon = "\U0001f7e2" if pc >= 0 else "\U0001f534"
+    pc_str = f"{pc_icon} {pc:+.2f}%" if pc != 0 else "\u2014"
+
+    socials = data.get("social_links", {})
+    social_parts = []
+    social_icons = {"website": "\U0001f310", "twitter": "\U0001f426", "telegram": "\U0001f4ac", "discord": "\U0001f3ae"}
+    for key, icon in social_icons.items():
+        url = socials.get(key, "")
+        if url:
+            social_parts.append(f'<a href="{url}">{icon} {key.title()}</a>')
+    social_str = " | ".join(social_parts) if social_parts else "None found"
+
+    txns = data.get("txns_24h", {})
+    buys = txns.get("buys", 0)
+    sells = txns.get("sells", 0)
+
+    chain_slug = {"SOL": "solana", "ETH": "ether", "BSC": "bsc"}.get(CHAIN.upper(), "solana")
+    dextools_url = f"https://www.dextools.io/app/en/{chain_slug}/pair-explorer/{data.get('pair_address') or token_address}"
+    ds_url = data.get("dexscreener_url") or f"https://dexscreener.com/{chain_slug}/{token_address}"
+
+    msg = (
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001f52c <b>TOKEN INFO</b>\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001fa99 <b>{data['name']}</b> ({data['symbol']})\n"
+        f"\U0001f4c4 <code>{token_address}</code>\n"
+        f"\u26d3 {CHAIN.upper()} | Age: {data['age_str']}\n\n"
+        f"\U0001f4b0 <b>Price:</b> ${data['price_usd']:.8g} ({data['price_native']:.10f} {native})\n"
+        f"\U0001f4ca <b>MCap:</b> ${data['market_cap']:,.0f}\n"
+        f"\U0001f4a7 <b>Liquidity:</b> ${data['liquidity']:,.0f}\n"
+        f"\U0001f4c8 <b>Volume 24h:</b> ${data['volume_24h']:,.0f}\n"
+        f"\U0001f4c9 <b>24h Change:</b> {pc_str}\n"
+        f"\U0001f504 <b>Txns 24h:</b> {buys} buys / {sells} sells\n"
+    )
+
+    if data["holders"] > 0:
+        msg += f"\U0001f465 <b>Holders:</b> {data['holders']:,}\n"
+
+    msg += (
+        f"\n\U0001f6e1 <b>Safety:</b> {hp_icon}\n"
+        f"\U0001f4b8 <b>Tax:</b> Buy {data['buy_tax']:.1f}% / Sell {data['sell_tax']:.1f}%\n"
+        f"\u2b50 <b>Score:</b> {data['score_bar']}\n"
+        f"\n\U0001f517 {social_str}\n"
+        f'\n<a href="{dextools_url}">\U0001f4ca DexTools</a> | <a href="{ds_url}">\U0001f4ca DexScreener</a>\n'
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+    )
+
+    tp = token_address[:16]
+    keyboard = [
+        [
+            InlineKeyboardButton("\U0001f6d2 Buy 0.1 SOL", callback_data=f"quickbuy:{tp}:0.1"),
+            InlineKeyboardButton("\U0001f6d2 Buy 0.5 SOL", callback_data=f"quickbuy:{tp}:0.5"),
+        ],
+        [
+            InlineKeyboardButton("\U0001f504 Refresh", callback_data=f"info_refresh:{token_address}"),
+        ],
+    ]
+
+    await update.message.reply_html(
+        msg,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_snipe(update, context):
+    """Sniper: /snipe <address> [amount] | /snipe list | /snipe remove <address>"""
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    if not SNIPER_ENABLED:
+        await update.message.reply_text("⚠️ Sniper mode is disabled. Set SNIPER_ENABLED=true to enable.")
+        return
+
+    user_id = update.effective_user.id
+    args = context.args or []
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+
+    if not args:
+        await update.message.reply_html(
+            "🎯 <b>Sniper Mode</b>\n\n"
+            "Usage:\n"
+            "<code>/snipe &lt;token_address&gt; [amount]</code> — Add to snipe list\n"
+            "<code>/snipe list</code> — Show your snipe targets\n"
+            "<code>/snipe remove &lt;token_address&gt;</code> — Remove from list\n\n"
+            f"Min liquidity: ${SNIPER_MIN_LIQUIDITY:,}\n"
+            f"Check interval: {SNIPER_CHECK_INTERVAL}s"
+        )
+        return
+
+    subcmd = args[0].lower()
+
+    if subcmd == "list":
+        targets = await db.get_user_snipe_targets(user_id)
+        if not targets:
+            await update.message.reply_text("🎯 No active snipe targets.")
+            return
+        lines = ["🎯 <b>Your Snipe Targets</b>\n"]
+        for i, t in enumerate(targets, 1):
+            amt = f"{t['amount']:.4f} {native}" if t["amount"] > 0 else "auto"
+            lines.append(f"{i}. <code>{t['token_address']}</code>\n   Amount: {amt} | Added: {t['added_at']}")
+        await update.message.reply_html("\n".join(lines))
+        return
+
+    if subcmd == "remove":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /snipe remove <token_address>")
+            return
+        addr = args[1].strip()
+        removed = await db.remove_snipe_target(addr, user_id)
+        if removed:
+            await update.message.reply_text(f"✅ Removed from snipe list.")
+        else:
+            await update.message.reply_text(f"❌ Not found in your snipe list.")
+        return
+
+    token_address = args[0].strip()
+    amount = 0.0
+    if len(args) >= 2:
+        try:
+            amount = float(args[1])
+            if amount < 0:
+                await update.message.reply_text("Amount must be positive.")
+                return
+        except ValueError:
+            await update.message.reply_text("Invalid amount.")
+            return
+
+    already = await db.is_token_already_bought(token_address, CHAIN.upper(), user_id)
+    if already:
+        await update.message.reply_text("Already holding this token.")
+        return
+
+    added = await db.add_snipe_target(token_address, user_id, amount)
+    if not added:
+        await update.message.reply_text("Already in your snipe list.")
+        return
+
+    amt_str = f"{amount:.4f} {native}" if amount > 0 else f"auto ({BUY_PERCENT}% of balance)"
+    await update.message.reply_html(
+        f"🎯 <b>Snipe Target Added</b>\n\n"
+        f"Token: <code>{token_address}</code>\n"
+        f"Amount: {amt_str}\n"
+        f"Min Liquidity: ${SNIPER_MIN_LIQUIDITY:,}\n\n"
+        f"The bot will auto-buy when a pool appears with sufficient liquidity.\n"
+        f"Checking every {SNIPER_CHECK_INTERVAL} seconds."
+    )
 
 
 async def cmd_portfolio(update, context):
@@ -1569,7 +1761,7 @@ async def cmd_fees(update, context):
 
 
 async def post_init(application):
-    global trader, monitor, notifier, whale_tracker, alerts_enabled
+    global trader, monitor, notifier, whale_tracker, alerts_enabled, sniper
 
     await db.init_db()
 
@@ -1582,6 +1774,9 @@ async def post_init(application):
 
     if CHAIN.upper() == "SOL" and WHALE_TRACKING_ENABLED:
         whale_tracker = WhaleTracker(trader.client, notifier)
+
+    if SNIPER_ENABLED:
+        sniper = Sniper(notifier)
 
     admin_wallet = await db.get_user_wallet(TELEGRAM_CHAT_ID)
     if not admin_wallet:
@@ -2320,6 +2515,72 @@ async def handle_callback(update, context):
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
 
+        elif data.startswith("info_refresh:"):
+            token_address = data.split(":", 1)[1]
+            await query.edit_message_text("\U0001f50d Refreshing...")
+            async with aiohttp.ClientSession() as session:
+                info_data = await fetch_token_research(session, CHAIN, token_address)
+            if info_data is None:
+                await query.edit_message_text("\u274c Could not refresh token data.")
+                return
+            native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+            hp_icon = "\U0001f6ab HONEYPOT" if info_data["is_honeypot"] else "\u2705 Safe" if info_data["honeypot_checked"] else "\u26a0\ufe0f Unknown"
+            pc = info_data["price_change_24h"]
+            pc_icon = "\U0001f7e2" if pc >= 0 else "\U0001f534"
+            pc_str = f"{pc_icon} {pc:+.2f}%" if pc != 0 else "\u2014"
+            socials = info_data.get("social_links", {})
+            social_parts = []
+            social_icons = {"website": "\U0001f310", "twitter": "\U0001f426", "telegram": "\U0001f4ac", "discord": "\U0001f3ae"}
+            for key, icon in social_icons.items():
+                url = socials.get(key, "")
+                if url:
+                    social_parts.append(f'<a href="{url}">{icon} {key.title()}</a>')
+            social_str = " | ".join(social_parts) if social_parts else "None found"
+            txns = info_data.get("txns_24h", {})
+            buys_count = txns.get("buys", 0)
+            sells_count = txns.get("sells", 0)
+            chain_slug = {"SOL": "solana", "ETH": "ether", "BSC": "bsc"}.get(CHAIN.upper(), "solana")
+            dextools_url = f"https://www.dextools.io/app/en/{chain_slug}/pair-explorer/{info_data.get('pair_address') or token_address}"
+            ds_url = info_data.get("dexscreener_url") or f"https://dexscreener.com/{chain_slug}/{token_address}"
+            msg = (
+                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                f"\U0001f52c <b>TOKEN INFO</b>\n"
+                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                f"\U0001fa99 <b>{info_data['name']}</b> ({info_data['symbol']})\n"
+                f"\U0001f4c4 <code>{token_address}</code>\n"
+                f"\u26d3 {CHAIN.upper()} | Age: {info_data['age_str']}\n\n"
+                f"\U0001f4b0 <b>Price:</b> ${info_data['price_usd']:.8g} ({info_data['price_native']:.10f} {native})\n"
+                f"\U0001f4ca <b>MCap:</b> ${info_data['market_cap']:,.0f}\n"
+                f"\U0001f4a7 <b>Liquidity:</b> ${info_data['liquidity']:,.0f}\n"
+                f"\U0001f4c8 <b>Volume 24h:</b> ${info_data['volume_24h']:,.0f}\n"
+                f"\U0001f4c9 <b>24h Change:</b> {pc_str}\n"
+                f"\U0001f504 <b>Txns 24h:</b> {buys_count} buys / {sells_count} sells\n"
+            )
+            if info_data["holders"] > 0:
+                msg += f"\U0001f465 <b>Holders:</b> {info_data['holders']:,}\n"
+            msg += (
+                f"\n\U0001f6e1 <b>Safety:</b> {hp_icon}\n"
+                f"\U0001f4b8 <b>Tax:</b> Buy {info_data['buy_tax']:.1f}% / Sell {info_data['sell_tax']:.1f}%\n"
+                f"\u2b50 <b>Score:</b> {info_data['score_bar']}\n"
+                f"\n\U0001f517 {social_str}\n"
+                f'\n<a href="{dextools_url}">\U0001f4ca DexTools</a> | <a href="{ds_url}">\U0001f4ca DexScreener</a>\n'
+                "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+            )
+            tp = token_address[:16]
+            keyboard = [
+                [
+                    InlineKeyboardButton("\U0001f6d2 Buy 0.1 SOL", callback_data=f"quickbuy:{tp}:0.1"),
+                    InlineKeyboardButton("\U0001f6d2 Buy 0.5 SOL", callback_data=f"quickbuy:{tp}:0.5"),
+                ],
+                [
+                    InlineKeyboardButton("\U0001f504 Refresh", callback_data=f"info_refresh:{token_address}"),
+                ],
+            ]
+            await query.edit_message_text(
+                msg, parse_mode="HTML", disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+
         elif data.startswith("quickbuy:"):
             parts = data.split(":")
             if len(parts) == 3:
@@ -2595,6 +2856,8 @@ def main():
     app.add_handler(CommandHandler("config", cmd_config))
     app.add_handler(CommandHandler("buy", cmd_buy))
     app.add_handler(CommandHandler("sell", cmd_sell))
+    app.add_handler(CommandHandler("info", cmd_info))
+    app.add_handler(CommandHandler("snipe", cmd_snipe))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     app.add_handler(CommandHandler("adduser", cmd_adduser))
     app.add_handler(CommandHandler("removeuser", cmd_removeuser))

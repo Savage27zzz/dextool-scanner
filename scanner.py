@@ -7,6 +7,7 @@ import db
 from config import (
     CHAIN,
     CHAIN_MAP,
+    DS_CHAIN_MAP,
     DEXTOOLS_API_KEY,
     DEXTOOLS_BASE_URL,
     MAX_MCAP,
@@ -346,6 +347,141 @@ async def scan_for_new_tokens(session: aiohttp.ClientSession, chain: str | None 
 
 
 from dexscreener import scan_dexscreener
+
+
+async def fetch_token_research(session: aiohttp.ClientSession, chain: str, address: str) -> dict | None:
+    """Fetch comprehensive token data for /info command. No filters applied."""
+    chain_id = CHAIN_MAP.get(chain.upper(), "solana")
+    ds_chain_id = DS_CHAIN_MAP.get(chain.upper(), "solana")
+
+    from dexscreener import _fetch_token_pairs, _safe_float as ds_safe_float
+    pairs = await _fetch_token_pairs(session, ds_chain_id, address)
+
+    pair_data = {}
+    if pairs:
+        best_pair = max(pairs, key=lambda p: ds_safe_float((p.get("liquidity") or {}).get("usd")))
+        base = best_pair.get("baseToken", {})
+        liq = best_pair.get("liquidity") or {}
+        vol = best_pair.get("volume") or {}
+        pc = best_pair.get("priceChange") or {}
+        txns = (best_pair.get("txns") or {}).get("h24", {})
+
+        pair_data = {
+            "name": base.get("name", "Unknown"),
+            "symbol": base.get("symbol", "???"),
+            "price_usd": ds_safe_float(best_pair.get("priceUsd")),
+            "price_native": ds_safe_float(best_pair.get("priceNative")),
+            "market_cap": ds_safe_float(best_pair.get("marketCap") or best_pair.get("fdv")),
+            "liquidity": ds_safe_float(liq.get("usd")),
+            "volume_24h": ds_safe_float(vol.get("h24")),
+            "price_change_24h": ds_safe_float(pc.get("h24")),
+            "txns_24h": {"buys": txns.get("buys", 0), "sells": txns.get("sells", 0)},
+            "pair_address": best_pair.get("pairAddress", ""),
+            "pair_created_at": best_pair.get("pairCreatedAt"),
+            "dexscreener_url": best_pair.get("url", ""),
+        }
+
+        info = best_pair.get("info") or {}
+        socials = {}
+        for s in (info.get("socials") or []):
+            if s.get("type") and s.get("url"):
+                socials[s["type"]] = s["url"]
+        for w in (info.get("websites") or []):
+            if w.get("url"):
+                socials["website"] = w["url"]
+                break
+        pair_data["social_links"] = socials
+
+    dt_details = None
+    dt_audit = None
+    dt_info = None
+    holders = 0
+    if DEXTOOLS_API_KEY:
+        dt_details, dt_audit, dt_info = await asyncio.gather(
+            _fetch_token_details(session, chain_id, address),
+            _fetch_token_audit(session, chain_id, address),
+            _fetch_token_info(session, chain_id, address),
+            return_exceptions=True,
+        )
+        if isinstance(dt_details, Exception):
+            dt_details = None
+        if isinstance(dt_audit, Exception):
+            dt_audit = None
+        if isinstance(dt_info, Exception):
+            dt_info = None
+
+        if dt_details and isinstance(dt_details, dict):
+            holders = _safe_int(dt_details.get("holders"))
+
+        if dt_info and isinstance(dt_info, dict):
+            if not pair_data.get("social_links"):
+                pair_data["social_links"] = {}
+            for key in ("website", "twitter", "telegram", "discord"):
+                val = dt_info.get(key, "")
+                if val and key not in pair_data.get("social_links", {}):
+                    pair_data["social_links"][key] = val
+
+    hp = await check_honeypot(session, chain, address)
+
+    name = pair_data.get("name") or (dt_details.get("name") if dt_details else None) or "Unknown"
+    symbol = pair_data.get("symbol") or (dt_details.get("symbol") if dt_details else None) or "???"
+
+    buy_tax = hp["buy_tax"] if hp["checked"] else (
+        _safe_float(dt_audit.get("buyTax")) if dt_audit and isinstance(dt_audit, dict) else 0.0
+    )
+    sell_tax = hp["sell_tax"] if hp["checked"] else (
+        _safe_float(dt_audit.get("sellTax")) if dt_audit and isinstance(dt_audit, dict) else 0.0
+    )
+
+    age_str = "Unknown"
+    created_at = pair_data.get("pair_created_at")
+    if created_at:
+        try:
+            from datetime import datetime, timezone
+            ct = datetime.fromtimestamp(created_at / 1000, tz=timezone.utc)
+            age_delta = datetime.now(timezone.utc) - ct
+            hours = age_delta.total_seconds() / 3600
+            if hours < 1:
+                age_str = f"{int(age_delta.total_seconds() / 60)}m"
+            elif hours < 24:
+                age_str = f"{hours:.1f}h"
+            elif hours < 720:
+                age_str = f"{hours / 24:.1f}d"
+            else:
+                age_str = f"{hours / 720:.0f}mo"
+        except Exception:
+            pass
+
+    result = {
+        "name": name,
+        "symbol": symbol,
+        "contract_address": address,
+        "chain": chain.upper(),
+        "market_cap": pair_data.get("market_cap", 0),
+        "liquidity": pair_data.get("liquidity", 0),
+        "price_usd": pair_data.get("price_usd", 0),
+        "price_native": pair_data.get("price_native", 0),
+        "volume_24h": pair_data.get("volume_24h", 0),
+        "price_change_24h": pair_data.get("price_change_24h", 0),
+        "holders": holders,
+        "buy_tax": buy_tax,
+        "sell_tax": sell_tax,
+        "is_honeypot": hp["is_honeypot"],
+        "honeypot_checked": hp["checked"],
+        "social_links": pair_data.get("social_links", {}),
+        "txns_24h": pair_data.get("txns_24h", {}),
+        "pair_address": pair_data.get("pair_address", ""),
+        "dexscreener_url": pair_data.get("dexscreener_url", ""),
+        "age_str": age_str,
+    }
+
+    from scorer import score_token, format_score_bar
+    scored = score_token(dict(result))
+    result["score"] = scored["score"]
+    result["score_breakdown"] = scored["score_breakdown"]
+    result["score_bar"] = format_score_bar(scored["score"])
+
+    return result
 
 
 async def scan_all_sources(session: aiohttp.ClientSession, chain: str | None = None) -> list[dict]:

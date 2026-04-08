@@ -76,6 +76,10 @@ API_KEY: str = _env("API_KEY", default="")
 
 ALERT_BROADCAST: bool = _env("ALERT_BROADCAST", default="false", cast=lambda v: v.lower() in ("true", "1", "yes"))
 
+SNIPER_ENABLED: bool = _env("SNIPER_ENABLED", default="false", cast=lambda v: v.lower() in ("true", "1", "yes"))
+SNIPER_CHECK_INTERVAL: int = _env("SNIPER_CHECK_INTERVAL", default="10", cast=int)
+SNIPER_MIN_LIQUIDITY: int = _env("SNIPER_MIN_LIQUIDITY", default="1000", cast=int)
+
 SELL_TIERS_RAW: str = _env("SELL_TIERS", default="")
 
 
