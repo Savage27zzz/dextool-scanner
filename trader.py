@@ -229,8 +229,24 @@ class SolanaTrader:
         amount = max(0, amount - SOL_FEE_RESERVE)
         return amount
 
-    async def get_token_price_via_jupiter(self, token_mint: str) -> float:
-        """Return price as SOL per token (same unit as entry_price)."""
+    async def _get_mint_decimals(self, token_mint: str) -> int:
+        """Get token decimals by reading the mint account directly from chain."""
+        try:
+            from solders.pubkey import Pubkey
+            mint_pubkey = Pubkey.from_string(token_mint)
+            resp = await self.client.get_account_info(mint_pubkey)
+            if resp.value and resp.value.data:
+                data = bytes(resp.value.data)
+                if len(data) >= 45:
+                    return data[44]
+            logger.warning("Could not read mint decimals for %s, defaulting to 9", token_mint)
+            return 9
+        except Exception as exc:
+            logger.warning("_get_mint_decimals error for %s: %s – defaulting to 9", token_mint, exc)
+            return 9
+
+    async def _get_price_via_quote(self, token_mint: str) -> float:
+        """Get SOL-per-token price using Jupiter Quote API."""
         try:
             test_lamports = 100_000_000  # 0.1 SOL
             async with aiohttp.ClientSession() as session:
@@ -249,9 +265,7 @@ class SolanaTrader:
                     if out_amount <= 0:
                         return 0.0
 
-                    _, decimals = await self.get_token_balance(token_mint)
-                    if decimals == 0:
-                        decimals = 9
+                    decimals = await self._get_mint_decimals(token_mint)
 
                     sol_amount = test_lamports / 1e9
                     tokens_human = out_amount / (10 ** decimals)
@@ -259,10 +273,37 @@ class SolanaTrader:
                     if tokens_human <= 0:
                         return 0.0
 
-                    return sol_amount / tokens_human
+                    price = sol_amount / tokens_human
+                    logger.debug("Price for %s: %.12f SOL (decimals=%d)", token_mint, price, decimals)
+                    return price
         except Exception as exc:
-            logger.error("get_token_price_via_jupiter error for %s: %s", token_mint, exc)
+            logger.error("_get_price_via_quote error for %s: %s", token_mint, exc)
             return 0.0
+
+    async def _get_price_via_jupiter_api(self, token_mint: str) -> float:
+        """Fallback: use Jupiter Price API v2 to get SOL-denominated price."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                params = {"ids": token_mint, "vsToken": WSOL_MINT}
+                async with session.get(JUPITER_PRICE_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        return 0.0
+                    data = await resp.json()
+                    token_data = data.get("data", {}).get(token_mint)
+                    if token_data and token_data.get("price"):
+                        return float(token_data["price"])
+            return 0.0
+        except Exception as exc:
+            logger.error("Jupiter Price API fallback error for %s: %s", token_mint, exc)
+            return 0.0
+
+    async def get_token_price_via_jupiter(self, token_mint: str) -> float:
+        """Return price as SOL per token (same unit as entry_price)."""
+        price = await self._get_price_via_quote(token_mint)
+        if price > 0:
+            return price
+        logger.warning("Quote-based price failed for %s, trying Price API fallback", token_mint)
+        return await self._get_price_via_jupiter_api(token_mint)
 
     async def buy_token(self, token_mint: str, amount_sol: float) -> dict | None:
         try:

@@ -66,7 +66,7 @@ ANTIRUG_LIQ_DROP_PCT: int = _env("ANTIRUG_LIQ_DROP_PCT", default="70", cast=int)
 OPERATOR_FEE_PCT: float = _env("OPERATOR_FEE_PCT", default="5", cast=float)
 OPERATOR_FEE_ENABLED: bool = _env("OPERATOR_FEE_ENABLED", default="true", cast=lambda v: v.lower() in ("true", "1", "yes"))
 
-MAX_OPEN_POSITIONS: int = _env("MAX_OPEN_POSITIONS", default="5", cast=int)
+MAX_OPEN_POSITIONS: int = _env("MAX_OPEN_POSITIONS", default="3", cast=int)
 MAX_DAILY_LOSS: float = _env("MAX_DAILY_LOSS", default="2.0", cast=float)  # in native token (SOL/ETH/BNB)
 MAX_BUY_AMOUNT: float = _env("MAX_BUY_AMOUNT", default="1.0", cast=float)  # max per single buy in native token
 

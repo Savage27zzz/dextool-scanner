@@ -260,7 +260,7 @@ class ProfitMonitor:
 
                 current_price = await self._get_current_price(token_address, chain)
                 if current_price <= 0:
-                    logger.debug("Could not get price for %s", symbol)
+                    logger.warning("Could not get price for %s — skipping TP/SL check", symbol)
                     continue
 
                 roi = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
