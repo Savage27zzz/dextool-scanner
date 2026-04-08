@@ -250,6 +250,15 @@ CREATE TABLE IF NOT EXISTS limit_orders (
 );
 """
 
+_CREATE_COMPOUND_FUND = """
+CREATE TABLE IF NOT EXISTS compound_fund (
+    user_id INTEGER PRIMARY KEY,
+    available REAL DEFAULT 0.0,
+    total_compounded REAL DEFAULT 0.0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 
 async def _conn() -> aiosqlite.Connection:
     db = await aiosqlite.connect(str(DB_PATH))
@@ -278,6 +287,7 @@ async def init_db():
         await db.execute(_CREATE_TOKEN_WHITELIST)
         await db.execute(_CREATE_DCA_ORDERS)
         await db.execute(_CREATE_LIMIT_ORDERS)
+        await db.execute(_CREATE_COMPOUND_FUND)
         try:
             await db.execute("ALTER TABLE open_positions ADD COLUMN peak_price REAL DEFAULT 0")
         except Exception:
@@ -336,6 +346,14 @@ async def init_db():
                     logger.info("Migrated open_positions table with user_id constraint")
         except Exception as exc:
             logger.warning("open_positions migration check: %s", exc)
+        try:
+            await db.execute("ALTER TABLE user_settings ADD COLUMN compound_enabled INTEGER")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE user_settings ADD COLUMN compound_percent INTEGER")
+        except Exception:
+            pass
         await db.commit()
     logger.info("Database initialised at %s", DB_PATH)
 
@@ -1201,6 +1219,7 @@ async def mark_snipe_filled(token_address: str, user_id: int, tx_hash: str):
 _USER_SETTINGS_COLUMNS = frozenset({
     "min_score", "stop_loss", "take_profit", "buy_percent",
     "trailing_drop", "slippage", "max_positions", "max_buy_amount",
+    "compound_enabled", "compound_percent",
 })
 
 
@@ -1455,6 +1474,7 @@ async def get_effective_config(user_id: int) -> dict:
     from config import (
         MIN_SCORE, STOP_LOSS, TAKE_PROFIT, BUY_PERCENT,
         TRAILING_DROP, SLIPPAGE, MAX_OPEN_POSITIONS, MAX_BUY_AMOUNT,
+        COMPOUND_ENABLED, COMPOUND_PERCENT,
     )
     defaults = {
         "min_score": MIN_SCORE,
@@ -1465,6 +1485,8 @@ async def get_effective_config(user_id: int) -> dict:
         "slippage": SLIPPAGE,
         "max_positions": MAX_OPEN_POSITIONS,
         "max_buy_amount": MAX_BUY_AMOUNT,
+        "compound_enabled": COMPOUND_ENABLED,
+        "compound_percent": COMPOUND_PERCENT,
     }
     user = await get_user_settings(user_id)
     if user:
@@ -1473,3 +1495,171 @@ async def get_effective_config(user_id: int) -> dict:
             if val is not None:
                 defaults[key] = val
     return defaults
+
+
+# ---------------------------------------------------------------------------
+# Compound fund helpers
+# ---------------------------------------------------------------------------
+
+async def add_compound_funds(user_id: int, amount: float):
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        await conn.execute(
+            "INSERT INTO compound_fund (user_id, available, total_compounded, updated_at) "
+            "VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "available = available + excluded.available, "
+            "total_compounded = total_compounded + excluded.total_compounded, "
+            "updated_at = CURRENT_TIMESTAMP",
+            (user_id, amount, amount),
+        )
+        await conn.commit()
+
+
+async def get_compound_fund(user_id: int) -> float:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        cursor = await conn.execute(
+            "SELECT available FROM compound_fund WHERE user_id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+    return float(row[0]) if row else 0.0
+
+
+async def deduct_compound_funds(user_id: int, amount: float):
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        await conn.execute(
+            "UPDATE compound_fund SET available = MAX(available - ?, 0), "
+            "updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+            (amount, user_id),
+        )
+        await conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# PnL report helpers
+# ---------------------------------------------------------------------------
+
+async def get_daily_pnl_report(user_id: int) -> dict | None:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+
+        cursor = await conn.execute("""
+            SELECT
+                COUNT(*) as trades_today,
+                COALESCE(SUM(CASE WHEN roi_percent > 0 THEN 1 ELSE 0 END), 0) as wins,
+                COALESCE(SUM(CASE WHEN roi_percent <= 0 THEN 1 ELSE 0 END), 0) as losses,
+                COALESCE(SUM(sell_amount_native - buy_amount_native), 0) as net_pnl
+            FROM completed_trades
+            WHERE user_id = ? AND closed_at >= date('now')
+        """, (user_id,))
+        row = dict(await cursor.fetchone())
+
+        trades_today = row["trades_today"]
+        wins = row["wins"]
+        losses = row["losses"]
+        net_pnl = row["net_pnl"]
+        win_rate = (wins / trades_today * 100) if trades_today > 0 else 0
+
+        best_trade = None
+        worst_trade = None
+        if trades_today > 0:
+            cursor = await conn.execute("""
+                SELECT token_symbol as symbol, roi_percent as roi
+                FROM completed_trades
+                WHERE user_id = ? AND closed_at >= date('now')
+                ORDER BY roi_percent DESC LIMIT 1
+            """, (user_id,))
+            best_row = await cursor.fetchone()
+            if best_row:
+                best_trade = dict(best_row)
+
+            cursor = await conn.execute("""
+                SELECT token_symbol as symbol, roi_percent as roi
+                FROM completed_trades
+                WHERE user_id = ? AND closed_at >= date('now')
+                ORDER BY roi_percent ASC LIMIT 1
+            """, (user_id,))
+            worst_row = await cursor.fetchone()
+            if worst_row:
+                worst_trade = dict(worst_row)
+
+        cursor = await conn.execute("""
+            SELECT COUNT(*) as cnt, COALESCE(SUM(buy_amount_native), 0) as total_invested
+            FROM open_positions WHERE user_id = ?
+        """, (user_id,))
+        pos_row = dict(await cursor.fetchone())
+
+    return {
+        "trades_today": trades_today,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "net_pnl": net_pnl,
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+        "open_count": pos_row["cnt"],
+        "total_invested": pos_row["total_invested"],
+    }
+
+
+async def get_pnl_report(user_id: int, days: int = 1) -> dict | None:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        date_filter = f"-{days} days"
+
+        cursor = await conn.execute("""
+            SELECT
+                COUNT(*) as trades,
+                COALESCE(SUM(CASE WHEN roi_percent > 0 THEN 1 ELSE 0 END), 0) as wins,
+                COALESCE(SUM(CASE WHEN roi_percent <= 0 THEN 1 ELSE 0 END), 0) as losses,
+                COALESCE(SUM(sell_amount_native - buy_amount_native), 0) as net_pnl
+            FROM completed_trades
+            WHERE user_id = ? AND closed_at >= datetime('now', ?)
+        """, (user_id, date_filter))
+        row = dict(await cursor.fetchone())
+
+        trades = row["trades"]
+        wins = row["wins"]
+        losses = row["losses"]
+        net_pnl = row["net_pnl"]
+        win_rate = (wins / trades * 100) if trades > 0 else 0
+
+        best_trade = None
+        worst_trade = None
+        if trades > 0:
+            cursor = await conn.execute("""
+                SELECT token_symbol as symbol, roi_percent as roi
+                FROM completed_trades
+                WHERE user_id = ? AND closed_at >= datetime('now', ?)
+                ORDER BY roi_percent DESC LIMIT 1
+            """, (user_id, date_filter))
+            best_row = await cursor.fetchone()
+            if best_row:
+                best_trade = dict(best_row)
+
+            cursor = await conn.execute("""
+                SELECT token_symbol as symbol, roi_percent as roi
+                FROM completed_trades
+                WHERE user_id = ? AND closed_at >= datetime('now', ?)
+                ORDER BY roi_percent ASC LIMIT 1
+            """, (user_id, date_filter))
+            worst_row = await cursor.fetchone()
+            if worst_row:
+                worst_trade = dict(worst_row)
+
+        cursor = await conn.execute("""
+            SELECT COUNT(*) as cnt, COALESCE(SUM(buy_amount_native), 0) as total_invested
+            FROM open_positions WHERE user_id = ?
+        """, (user_id,))
+        pos_row = dict(await cursor.fetchone())
+
+    return {
+        "trades": trades,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "net_pnl": net_pnl,
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+        "open_count": pos_row["cnt"],
+        "total_invested": pos_row["total_invested"],
+    }

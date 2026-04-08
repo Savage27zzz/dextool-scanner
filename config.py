@@ -71,6 +71,9 @@ MAX_OPEN_POSITIONS: int = _env("MAX_OPEN_POSITIONS", default="3", cast=int)
 MAX_DAILY_LOSS: float = _env("MAX_DAILY_LOSS", default="2.0", cast=float)  # in native token (SOL/ETH/BNB)
 MAX_BUY_AMOUNT: float = _env("MAX_BUY_AMOUNT", default="1.0", cast=float)  # max per single buy in native token
 
+COMPOUND_ENABLED: bool = _env("COMPOUND_ENABLED", default="false", cast=lambda v: v.lower() in ("true", "1", "yes"))
+COMPOUND_PERCENT: int = _env("COMPOUND_PERCENT", default="50", cast=int)
+
 API_ENABLED: bool = _env("API_ENABLED", default="false", cast=lambda v: v.lower() in ("true", "1", "yes"))
 API_PORT: int = _env("API_PORT", default="8080", cast=int)
 API_KEY: str = _env("API_KEY", default="")

@@ -178,6 +178,23 @@ class ProfitMonitor:
         except Exception as exc:
             logger.error("Fee collection error for user %d: %s", user_id, exc)
 
+    async def _try_compound(self, user_id: int, profit_native: float):
+        try:
+            user_cfg = await db.get_effective_config(user_id)
+            if not user_cfg.get("compound_enabled"):
+                return
+            compound_pct = user_cfg.get("compound_percent", 50)
+            compound_amount = (profit_native * compound_pct) / 100
+            if compound_amount < 0.0001:
+                return
+            await db.add_compound_funds(user_id, compound_amount)
+            logger.info(
+                "Compounded %.6f SOL for user %d (%d%% of %.6f profit)",
+                compound_amount, user_id, compound_pct, profit_native,
+            )
+        except Exception as exc:
+            logger.error("Compound error for user %d: %s", user_id, exc)
+
     async def check_positions(self):
         positions = await db.get_open_positions()
         if not positions:
@@ -258,6 +275,7 @@ class ProfitMonitor:
                             await self._admin_summary(user_id, "Anti-rug sell", symbol, round(roi, 2), loss_native)
                             if loss_native > 0:
                                 await self._try_collect_fee(user_id, symbol, loss_native, notify_chat_id)
+                                await self._try_compound(user_id, loss_native)
                         continue
 
                 current_price = await self._get_current_price(token_address, chain)
@@ -309,6 +327,7 @@ class ProfitMonitor:
                                 await self._admin_summary(user_id, f"{tier_label} sell", symbol, round(roi, 2), profit_native)
                                 if profit_native > 0:
                                     await self._try_collect_fee(user_id, symbol, profit_native, notify_chat_id)
+                                    await self._try_compound(user_id, profit_native)
 
                     if tiers_changed:
                         await db.update_tiers_completed(token_address, chain, tiers_completed, user_id=user_id)
@@ -367,6 +386,7 @@ class ProfitMonitor:
                                     await self._admin_summary(user_id, "Trailing-TP sell", symbol, round(roi, 2), profit_native)
                                     if profit_native > 0:
                                         await self._try_collect_fee(user_id, symbol, profit_native, notify_chat_id)
+                                        await self._try_compound(user_id, profit_native)
 
                 else:
                     if roi >= user_cfg["take_profit"]:
@@ -391,6 +411,7 @@ class ProfitMonitor:
                             await self._admin_summary(user_id, "Take-profit sell", symbol, round(roi, 2), profit_native)
                             if profit_native > 0:
                                 await self._try_collect_fee(user_id, symbol, profit_native, notify_chat_id)
+                                await self._try_compound(user_id, profit_native)
 
                 if not sold and user_cfg["stop_loss"] < 0 and roi <= user_cfg["stop_loss"]:
                     logger.info("SL hit for %s – ROI %.2f%% <= %d%%", symbol, roi, user_cfg["stop_loss"])
@@ -413,6 +434,7 @@ class ProfitMonitor:
                         await self._admin_summary(user_id, "Stop-loss sell", symbol, round(roi, 2), loss_native)
                         if loss_native > 0:
                             await self._try_collect_fee(user_id, symbol, loss_native, notify_chat_id)
+                            await self._try_compound(user_id, loss_native)
 
             except Exception as exc:
                 logger.error("Error checking position %s: %s", symbol, exc)
