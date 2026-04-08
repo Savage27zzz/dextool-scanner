@@ -189,6 +189,31 @@ CREATE TABLE IF NOT EXISTS fee_ledger (
 """
 
 
+_CREATE_TOKEN_BLACKLIST = """
+CREATE TABLE IF NOT EXISTS token_blacklist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_address TEXT NOT NULL,
+    chain TEXT NOT NULL DEFAULT 'SOL',
+    reason TEXT DEFAULT '',
+    added_by INTEGER NOT NULL,
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(token_address, chain)
+);
+"""
+
+_CREATE_TOKEN_WHITELIST = """
+CREATE TABLE IF NOT EXISTS token_whitelist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_address TEXT NOT NULL,
+    chain TEXT NOT NULL DEFAULT 'SOL',
+    label TEXT DEFAULT '',
+    added_by INTEGER NOT NULL,
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(token_address, chain)
+);
+"""
+
+
 async def _conn() -> aiosqlite.Connection:
     db = await aiosqlite.connect(str(DB_PATH))
     db.row_factory = aiosqlite.Row
@@ -212,6 +237,8 @@ async def init_db():
         await db.execute(_CREATE_SCAN_HISTORY)
         await db.execute(_CREATE_SNIPE_TARGETS)
         await db.execute(_CREATE_USER_SETTINGS)
+        await db.execute(_CREATE_TOKEN_BLACKLIST)
+        await db.execute(_CREATE_TOKEN_WHITELIST)
         try:
             await db.execute("ALTER TABLE open_positions ADD COLUMN peak_price REAL DEFAULT 0")
         except Exception:
@@ -1170,6 +1197,88 @@ async def delete_user_settings(user_id: int) -> bool:
         )
         await conn.commit()
     return cursor.rowcount > 0
+
+
+async def add_to_blacklist(token_address: str, chain: str, reason: str, added_by: int) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        try:
+            await conn.execute(
+                "INSERT INTO token_blacklist (token_address, chain, reason, added_by) VALUES (?, ?, ?, ?)",
+                (token_address, chain, reason, added_by),
+            )
+            await conn.commit()
+            return True
+        except Exception:
+            return False
+
+
+async def remove_from_blacklist(token_address: str, chain: str) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        cursor = await conn.execute(
+            "DELETE FROM token_blacklist WHERE token_address = ? AND chain = ?",
+            (token_address, chain),
+        )
+        await conn.commit()
+    return cursor.rowcount > 0
+
+
+async def is_blacklisted(token_address: str, chain: str) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        cursor = await conn.execute(
+            "SELECT 1 FROM token_blacklist WHERE token_address = ? AND chain = ?",
+            (token_address, chain),
+        )
+        row = await cursor.fetchone()
+    return row is not None
+
+
+async def get_blacklist() -> list[dict]:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute("SELECT * FROM token_blacklist ORDER BY added_at DESC")
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def add_to_whitelist(token_address: str, chain: str, label: str, added_by: int) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        try:
+            await conn.execute(
+                "INSERT INTO token_whitelist (token_address, chain, label, added_by) VALUES (?, ?, ?, ?)",
+                (token_address, chain, label, added_by),
+            )
+            await conn.commit()
+            return True
+        except Exception:
+            return False
+
+
+async def remove_from_whitelist(token_address: str, chain: str) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        cursor = await conn.execute(
+            "DELETE FROM token_whitelist WHERE token_address = ? AND chain = ?",
+            (token_address, chain),
+        )
+        await conn.commit()
+    return cursor.rowcount > 0
+
+
+async def is_whitelisted(token_address: str, chain: str) -> bool:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        cursor = await conn.execute(
+            "SELECT 1 FROM token_whitelist WHERE token_address = ? AND chain = ?",
+            (token_address, chain),
+        )
+        row = await cursor.fetchone()
+    return row is not None
+
+
+async def get_whitelist() -> list[dict]:
+    async with aiosqlite.connect(str(DB_PATH)) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute("SELECT * FROM token_whitelist ORDER BY added_at DESC")
+        rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
 
 
 async def get_effective_config(user_id: int) -> dict:

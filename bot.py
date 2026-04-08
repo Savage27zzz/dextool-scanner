@@ -149,6 +149,12 @@ async def scanner_loop():
 
                 for token in tokens:
                     try:
+                        contract = token.get("contract_address", "")
+
+                        if await db.is_blacklisted(contract, CHAIN.upper()):
+                            logger.debug("Skipping blacklisted token %s", token.get("symbol"))
+                            continue
+
                         await db.save_detected_token(token)
 
                         if alerts_enabled:
@@ -265,6 +271,49 @@ async def scanner_loop():
                     except Exception as exc:
                         logger.error("Error processing token %s: %s", token.get("symbol"), exc)
 
+                whitelist = await db.get_whitelist()
+                for wl_item in whitelist:
+                    wl_addr = wl_item["token_address"]
+                    trading_users = await db.get_all_trading_users()
+                    for user_wallet in trading_users:
+                        uid = user_wallet["user_id"]
+                        try:
+                            already = await db.is_token_already_bought(wl_addr, CHAIN.upper(), uid)
+                            if already:
+                                continue
+                            user_cfg = await db.get_effective_config(uid)
+                            open_count = await db.count_open_positions(uid)
+                            if open_count >= user_cfg["max_positions"]:
+                                continue
+                            user_trader = await create_user_trader(uid)
+                            if user_trader is None:
+                                continue
+                            buy_amount = await user_trader.get_buy_amount()
+                            if buy_amount <= 0:
+                                continue
+                            if user_cfg["max_buy_amount"] > 0 and buy_amount > user_cfg["max_buy_amount"]:
+                                buy_amount = user_cfg["max_buy_amount"]
+
+                            logger.info("Whitelist auto-buy: %s for user %d", wl_addr, uid)
+                            result = await user_trader.buy_token(wl_addr, buy_amount)
+                            if result:
+                                position = {
+                                    "token_address": wl_addr,
+                                    "token_symbol": wl_item.get("label", wl_addr[:8]),
+                                    "chain": CHAIN.upper(),
+                                    "entry_price": result["entry_price"],
+                                    "tokens_received": result["tokens_received"],
+                                    "buy_amount_native": result["amount_spent"],
+                                    "buy_tx_hash": result["tx_hash"],
+                                    "pair_address": "",
+                                    "entry_liquidity": 0,
+                                    "user_id": uid,
+                                }
+                                await db.save_open_position(position)
+                                await notifier.send_to_user(uid, f"\u2705 Whitelist buy: {wl_item.get('label', wl_addr[:8])} \u2014 {result['amount_spent']:.4f} {native}")
+                        except Exception as exc:
+                            logger.error("Whitelist buy error for %s user %d: %s", wl_addr, uid, exc)
+
         except Exception as exc:
             logger.error("Scanner error: %s", exc)
 
@@ -296,6 +345,7 @@ async def cmd_help(update, context):
         lines.append("/autotrade on|off — Toggle auto-trading")
         lines.append("/withdraw &lt;amount&gt; &lt;address&gt; — Withdraw SOL")
         lines.append("/export — Export wallet credentials (DM only)")
+        lines.append("/sellall — Panic sell all open positions")
         lines.append("/stats — Detailed trading performance analytics")
         lines.append("/lowcaps [count] — Show recent detected tokens")
         lines.append("")
@@ -320,6 +370,8 @@ async def cmd_help(update, context):
             lines.append("/stats all — All users' combined stats")
             lines.append("/alerts on|off — Toggle lowcap alert broadcasting")
             lines.append("/backtest [days] — Replay scoring strategy against history")
+            lines.append("/blacklist — Manage token blacklist")
+            lines.append("/whitelist — Manage token whitelist")
             from config import API_ENABLED, API_PORT
             lines.append(f"\nAPI: {'Enabled on port ' + str(API_PORT) if API_ENABLED else 'Disabled'}")
             lines.append(f"Sniper: {'Enabled' if SNIPER_ENABLED else 'Disabled'}")
@@ -2945,6 +2997,149 @@ async def cmd_backtest(update, context):
     await update.message.reply_html("\n".join(msg_parts))
 
 
+async def cmd_blacklist(update, context):
+    await _register_chat(update)
+    if not _is_admin(update):
+        await update.message.reply_text("\U0001f512 Admin only.")
+        return
+
+    if not context.args:
+        items = await db.get_blacklist()
+        if not items:
+            await update.message.reply_text("Blacklist is empty.")
+            return
+        lines = ["\U0001f6ab <b>Token Blacklist</b>\n"]
+        for item in items:
+            lines.append(f"\u2022 <code>{item['token_address'][:12]}\u2026</code> {item.get('reason', '')}")
+        await update.message.reply_html("\n".join(lines))
+        return
+
+    if context.args[0].lower() == "remove" and len(context.args) >= 2:
+        removed = await db.remove_from_blacklist(context.args[1], CHAIN.upper())
+        msg = "\u2705 Removed from blacklist." if removed else "Not found in blacklist."
+        await update.message.reply_text(msg)
+        return
+
+    token_addr = context.args[0]
+    reason = " ".join(context.args[1:]) if len(context.args) > 1 else ""
+    added = await db.add_to_blacklist(token_addr, CHAIN.upper(), reason, update.effective_user.id)
+    msg = "\U0001f6ab Added to blacklist." if added else "Already blacklisted."
+    await update.message.reply_text(msg)
+
+
+async def cmd_whitelist(update, context):
+    await _register_chat(update)
+    if not _is_admin(update):
+        await update.message.reply_text("\U0001f512 Admin only.")
+        return
+
+    if not context.args:
+        items = await db.get_whitelist()
+        if not items:
+            await update.message.reply_text("Whitelist is empty.")
+            return
+        lines = ["\u2705 <b>Token Whitelist</b>\n"]
+        for item in items:
+            lines.append(f"\u2022 <code>{item['token_address'][:12]}\u2026</code> {item.get('label', '')}")
+        await update.message.reply_html("\n".join(lines))
+        return
+
+    if context.args[0].lower() == "remove" and len(context.args) >= 2:
+        removed = await db.remove_from_whitelist(context.args[1], CHAIN.upper())
+        msg = "\u2705 Removed from whitelist." if removed else "Not found in whitelist."
+        await update.message.reply_text(msg)
+        return
+
+    token_addr = context.args[0]
+    label = " ".join(context.args[1:]) if len(context.args) > 1 else ""
+    added = await db.add_to_whitelist(token_addr, CHAIN.upper(), label, update.effective_user.id)
+    msg = "\u2705 Added to whitelist." if added else "Already whitelisted."
+    await update.message.reply_text(msg)
+
+
+async def cmd_sellall(update, context):
+    """Dump all open positions immediately."""
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    user_id = update.effective_user.id
+    user_trader = await create_user_trader(user_id)
+    if user_trader is None:
+        await update.message.reply_text("No wallet found.")
+        return
+
+    positions = await db.get_open_positions(user_id=user_id)
+    if not positions:
+        await update.message.reply_text("No open positions to sell.")
+        return
+
+    if not context.args or context.args[0].lower() != "confirm":
+        await update.message.reply_html(
+            f"\u26a0\ufe0f <b>PANIC SELL</b>\n\n"
+            f"This will sell ALL {len(positions)} open position(s) at market price.\n\n"
+            f"To confirm: <code>/sellall confirm</code>"
+        )
+        return
+
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    await update.message.reply_html(f"\U0001f534 <b>Selling all {len(positions)} positions...</b>")
+
+    sold = 0
+    failed = 0
+    total_received = 0.0
+
+    for pos in positions:
+        try:
+            token_address = pos["token_address"]
+            chain = pos["chain"]
+            symbol = pos["token_symbol"]
+
+            if chain.upper() == "SOL":
+                ui_balance, decimals = await user_trader.get_token_balance(token_address)
+                tokens_raw = int(ui_balance * (10**decimals)) if decimals > 0 else int(ui_balance * 1e9)
+            else:
+                continue
+
+            if tokens_raw <= 0:
+                exit_data = {
+                    "exit_price": 0, "sell_amount_native": 0,
+                    "profit_usd": None, "roi_percent": -100,
+                    "sell_tx_hash": "zero_balance", "duration_seconds": 0,
+                }
+                await db.close_position(token_address, chain, exit_data, user_id=user_id)
+                sold += 1
+                continue
+
+            result = await user_trader.sell_token(token_address, tokens_raw, decimals)
+            if result:
+                entry_price = pos["entry_price"]
+                roi = ((result["exit_price"] - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+                exit_data = {
+                    "exit_price": result["exit_price"],
+                    "sell_amount_native": result["native_received"],
+                    "profit_usd": None,
+                    "roi_percent": roi,
+                    "sell_tx_hash": result["tx_hash"],
+                    "duration_seconds": 0,
+                }
+                await db.close_position(token_address, chain, exit_data, user_id=user_id)
+                total_received += result["native_received"]
+                sold += 1
+            else:
+                failed += 1
+        except Exception as exc:
+            logger.error("Sellall error for %s: %s", pos.get("token_symbol"), exc)
+            failed += 1
+
+    await update.message.reply_html(
+        f"\U0001f534 <b>Panic Sell Complete</b>\n"
+        f"Sold: {sold}/{len(positions)}\n"
+        f"Failed: {failed}\n"
+        f"Total received: {total_received:.6f} {native}"
+    )
+
+
 def main():
     logger.info("Starting DexTool Scanner Bot …")
 
@@ -2986,6 +3181,9 @@ def main():
     app.add_handler(CommandHandler("alerts", cmd_alerts))
     app.add_handler(CommandHandler("lowcaps", cmd_lowcaps))
     app.add_handler(CommandHandler("backtest", cmd_backtest))
+    app.add_handler(CommandHandler("blacklist", cmd_blacklist))
+    app.add_handler(CommandHandler("whitelist", cmd_whitelist))
+    app.add_handler(CommandHandler("sellall", cmd_sellall))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     def _handle_signal(signum, frame):
