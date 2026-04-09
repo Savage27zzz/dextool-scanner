@@ -226,6 +226,13 @@ async def scanner_loop():
                                     buy_amount = user_cfg["max_buy_amount"]
                                     logger.debug("Capped buy for user %d to %.4f", uid, user_cfg["max_buy_amount"])
 
+                                # 4. Add compound funds if available
+                                compound_funds = await db.get_compound_fund(uid)
+                                if compound_funds > 0.01:
+                                    buy_amount += compound_funds
+                                    await db.deduct_compound_funds(uid, compound_funds)
+                                    logger.info("User %d compound buy: +%.4f %s from fund", uid, compound_funds, native)
+
                                 await notifier.send_to_user(
                                     uid,
                                     f"⚙️ Buying {token.get('symbol', '?')} with {buy_amount:.4f} {native}..."
@@ -349,10 +356,12 @@ async def cmd_help(update, context):
         lines.append("/export — Export wallet credentials (DM only)")
         lines.append("/sellall — Panic sell all open positions")
         lines.append("/stats — Detailed trading performance analytics")
+        lines.append("/pnl [days] — P&amp;L summary (default: today)")
         lines.append("/lowcaps [count] — Show recent detected tokens")
         lines.append("")
         lines.append("<b>⚙️ Settings:</b>")
         lines.append("/mysettings — View/edit your personal trading settings")
+        lines.append("/compound — Auto-compound settings &amp; fund")
         lines.append("/config — Current global bot configuration")
         if is_admin:
             lines.append("\n<b>Admin only:</b>")
@@ -586,26 +595,83 @@ async def cmd_stats(update, context):
 
 
 async def daily_report_loop():
+    global is_running
+    logger.info("Daily PnL loop started")
+
     while is_running:
-        now = datetime.now(timezone.utc)
-        tomorrow = (now + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        wait_seconds = (tomorrow - now).total_seconds()
-        await asyncio.sleep(wait_seconds)
-
-        if not is_running:
-            break
-
         try:
-            native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
-            stats = await db.get_trade_stats(days=1)
+            now = datetime.now(timezone.utc)
+            tomorrow = (now + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            wait_seconds = (tomorrow - now).total_seconds()
 
-            if stats["total_trades"] == 0:
-                continue
+            elapsed = 0
+            while elapsed < wait_seconds and is_running:
+                await asyncio.sleep(min(60, wait_seconds - elapsed))
+                elapsed += 60
 
-            await notifier.notify_daily_report(stats, native)
+            if not is_running:
+                break
+
+            await _send_daily_reports()
 
         except Exception as exc:
-            logger.error("Daily report error: %s", exc)
+            logger.error("Daily PnL loop error: %s", exc)
+            await asyncio.sleep(3600)
+
+
+async def _send_daily_reports():
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    trading_users = await db.get_all_trading_users()
+
+    for user_wallet in trading_users:
+        uid = user_wallet["user_id"]
+        try:
+            report = await db.get_daily_pnl_report(uid)
+            if report is None:
+                continue
+
+            balance = 0.0
+            try:
+                user_trader = await create_user_trader(uid)
+                if user_trader:
+                    balance = await user_trader.get_balance()
+            except Exception:
+                pass
+
+            lines = [
+                "━━━━━━━━━━━━━━━━━━━━━━",
+                "📊 <b>DAILY PnL REPORT</b>",
+                "━━━━━━━━━━━━━━━━━━━━━━",
+                f"📅 {datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+                "",
+            ]
+
+            if report["trades_today"] > 0:
+                pnl_emoji = "🟢" if report["net_pnl"] >= 0 else "🔴"
+                lines.append(f"<b>Today's Activity:</b>")
+                lines.append(f"  Trades closed: {report['trades_today']}")
+                lines.append(f"  Wins/Losses: {report['wins']}/{report['losses']}")
+                lines.append(f"  Win rate: {report['win_rate']:.0f}%")
+                lines.append(f"  {pnl_emoji} Net P&L: {report['net_pnl']:+.6f} {native}")
+                if report["best_trade"]:
+                    lines.append(f"  🏆 Best: {report['best_trade']['symbol']} ({report['best_trade']['roi']:+.1f}%)")
+                if report["worst_trade"]:
+                    lines.append(f"  💀 Worst: {report['worst_trade']['symbol']} ({report['worst_trade']['roi']:+.1f}%)")
+                lines.append("")
+            else:
+                lines.append("No trades closed today.\n")
+
+            lines.append(f"<b>Open Positions:</b> {report['open_count']}")
+            if report["open_count"] > 0:
+                lines.append(f"  Total invested: {report['total_invested']:.4f} {native}")
+
+            lines.append(f"\n💰 Wallet balance: {balance:.6f} {native}")
+            lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+
+            await notifier.send_to_user(uid, "\n".join(lines))
+
+        except Exception as exc:
+            logger.error("Daily report error for user %d: %s", uid, exc)
 
 
 async def cmd_wallet(update, context):
@@ -1991,7 +2057,7 @@ async def post_init(application):
 
 
 async def shutdown(application):
-    global is_running, api_runner, dca_task, limit_order_task
+    global is_running, api_runner, dca_task, limit_order_task, daily_report_task
     is_running = False
     await stop_api_server(api_runner)
     api_runner = None
@@ -2003,8 +2069,11 @@ async def shutdown(application):
         dca_task.cancel()
     if limit_order_task and not limit_order_task.done():
         limit_order_task.cancel()
+    if daily_report_task and not daily_report_task.done():
+        daily_report_task.cancel()
     dca_task = None
     limit_order_task = None
+    daily_report_task = None
     if trader:
         await trader.close()
     logger.info("Shutdown complete")
@@ -3348,6 +3417,132 @@ async def limit_order_loop():
 
 
 # ---------------------------------------------------------------------------
+# /pnl command
+# ---------------------------------------------------------------------------
+
+async def cmd_pnl(update, context):
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    user_id = update.effective_user.id
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+
+    days = 1
+    if context.args:
+        try:
+            days = int(context.args[0])
+            days = max(1, min(days, 30))
+        except ValueError:
+            pass
+
+    report = await db.get_pnl_report(user_id, days=days)
+    if report is None:
+        await update.message.reply_text("Could not generate report.")
+        return
+
+    balance = 0.0
+    try:
+        user_trader = await create_user_trader(user_id)
+        if user_trader:
+            balance = await user_trader.get_balance()
+    except Exception:
+        pass
+
+    period = "Today" if days == 1 else f"Last {days} days"
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "📊 <b>PnL REPORT</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"📅 {period}",
+        "",
+    ]
+
+    if report["trades"] > 0:
+        pnl_emoji = "🟢" if report["net_pnl"] >= 0 else "🔴"
+        lines.append("<b>Activity:</b>")
+        lines.append(f"  Trades closed: {report['trades']}")
+        lines.append(f"  Wins/Losses: {report['wins']}/{report['losses']}")
+        lines.append(f"  Win rate: {report['win_rate']:.0f}%")
+        lines.append(f"  {pnl_emoji} Net P&L: {report['net_pnl']:+.6f} {native}")
+        if report["best_trade"]:
+            lines.append(f"  🏆 Best: {report['best_trade']['symbol']} ({report['best_trade']['roi']:+.1f}%)")
+        if report["worst_trade"]:
+            lines.append(f"  💀 Worst: {report['worst_trade']['symbol']} ({report['worst_trade']['roi']:+.1f}%)")
+        lines.append("")
+    else:
+        lines.append("No trades closed in this period.\n")
+
+    lines.append(f"<b>Open Positions:</b> {report['open_count']}")
+    if report["open_count"] > 0:
+        lines.append(f"  Total invested: {report['total_invested']:.4f} {native}")
+
+    lines.append(f"\n💰 Wallet balance: {balance:.6f} {native}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+
+    await update.message.reply_html("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# /compound command
+# ---------------------------------------------------------------------------
+
+async def cmd_compound(update, context):
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    user_id = update.effective_user.id
+    native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
+    user_cfg = await db.get_effective_config(user_id)
+
+    if not context.args:
+        fund = await db.get_compound_fund(user_id)
+        status = "🟢 ON" if user_cfg.get("compound_enabled") else "🔴 OFF"
+        await update.message.reply_html(
+            f"🔄 <b>Auto-Compound</b>\n\n"
+            f"Status: {status}\n"
+            f"Reinvest: {user_cfg.get('compound_percent', 50)}% of profits\n"
+            f"Fund balance: {fund:.6f} {native}\n\n"
+            f"<code>/compound on</code> — enable\n"
+            f"<code>/compound off</code> — disable\n"
+            f"<code>/compound percent 75</code> — set reinvest %\n"
+            f"<code>/compound withdraw</code> — withdraw fund to wallet"
+        )
+        return
+
+    subcmd = context.args[0].lower()
+
+    if subcmd == "on":
+        await db.upsert_user_setting(user_id, "compound_enabled", 1)
+        await update.message.reply_text("🟢 Auto-compound enabled.")
+    elif subcmd == "off":
+        await db.upsert_user_setting(user_id, "compound_enabled", 0)
+        await update.message.reply_text("🔴 Auto-compound disabled.")
+    elif subcmd == "percent" and len(context.args) >= 2:
+        try:
+            pct = int(context.args[1])
+            if 1 <= pct <= 100:
+                await db.upsert_user_setting(user_id, "compound_percent", pct)
+                await update.message.reply_text(f"✅ Compound percent set to {pct}%.")
+            else:
+                await update.message.reply_text("Must be 1-100.")
+        except ValueError:
+            await update.message.reply_text("Invalid number.")
+    elif subcmd == "withdraw":
+        fund = await db.get_compound_fund(user_id)
+        if fund < 0.001:
+            await update.message.reply_text("Compound fund is empty.")
+        else:
+            await db.deduct_compound_funds(user_id, fund)
+            await update.message.reply_html(
+                f"✅ Withdrew {fund:.6f} {native} from compound fund to your wallet balance."
+            )
+    else:
+        await update.message.reply_text("Unknown subcommand. Use on, off, percent, or withdraw.")
+
+
+# ---------------------------------------------------------------------------
 # /dca command
 # ---------------------------------------------------------------------------
 
@@ -3618,6 +3813,8 @@ def main():
     app.add_handler(CommandHandler("dca", cmd_dca))
     app.add_handler(CommandHandler("limit", cmd_limit))
     app.add_handler(CommandHandler("orders", cmd_orders))
+    app.add_handler(CommandHandler("pnl", cmd_pnl))
+    app.add_handler(CommandHandler("compound", cmd_compound))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     def _handle_signal(signum, frame):
