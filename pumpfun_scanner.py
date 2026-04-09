@@ -310,7 +310,7 @@ async def check_dip_buys(session: aiohttp.ClientSession) -> list[dict]:
             initial_price = entry.get("initial_price", 0)
             smart_score = entry.get("smart_score", 0)
 
-            if initial_price <= 0 or smart_score < 60:
+            if smart_score < 60:
                 continue
 
             try:
@@ -324,6 +324,11 @@ async def check_dip_buys(session: aiohttp.ClientSession) -> list[dict]:
                 continue
 
             if current_price <= 0:
+                continue
+
+            if initial_price <= 0:
+                entry["initial_price"] = current_price
+                entry["peak_price"] = max(entry.get("peak_price", 0), current_price)
                 continue
 
             entry["current_price"] = current_price

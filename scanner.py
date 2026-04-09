@@ -577,7 +577,16 @@ async def scan_all_sources(session: aiohttp.ClientSession, chain: str | None = N
                 pf_count, legacy_count, len(merged),
             )
 
-            bought_addresses = {t.get("contract_address", "").lower() for t in merged}
+            bought_addresses = set()
+            for t in merged:
+                addr = t.get("contract_address", "").lower()
+                if not addr:
+                    continue
+                rec = t.get("recommendation", "")
+                if rec == "BUY":
+                    bought_addresses.add(addr)
+                elif not rec and t.get("score", 0) >= MIN_SCORE:
+                    bought_addresses.add(addr)
             try:
                 await db.save_scan_history_batch(merged, bought_addresses=bought_addresses)
             except Exception as exc:
