@@ -258,6 +258,37 @@ CREATE TABLE IF NOT EXISTS compound_fund (
 );
 """
 
+_CREATE_PUMPFUN_WATCHLIST = """
+CREATE TABLE IF NOT EXISTS pumpfun_watchlist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mint_address TEXT NOT NULL,
+    name TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    creator TEXT DEFAULT '',
+    smart_score INTEGER DEFAULT 0,
+    initial_price REAL DEFAULT 0,
+    peak_price REAL DEFAULT 0,
+    current_price REAL DEFAULT 0,
+    bonding_progress REAL DEFAULT 0,
+    is_graduated INTEGER DEFAULT 0,
+    dip_bought INTEGER DEFAULT 0,
+    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(mint_address)
+);
+"""
+
+_CREATE_DEV_ANALYSIS_CACHE = """
+CREATE TABLE IF NOT EXISTS dev_analysis_cache (
+    creator_address TEXT PRIMARY KEY,
+    tokens_created INTEGER DEFAULT 0,
+    success_rate REAL DEFAULT 0,
+    dev_score INTEGER DEFAULT 50,
+    flags TEXT DEFAULT '[]',
+    analyzed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 
 async def _conn() -> aiosqlite.Connection:
     db = await aiosqlite.connect(str(DB_PATH))
@@ -291,6 +322,8 @@ async def init_db():
         )
         await db.execute(_CREATE_LIMIT_ORDERS)
         await db.execute(_CREATE_COMPOUND_FUND)
+        await db.execute(_CREATE_PUMPFUN_WATCHLIST)
+        await db.execute(_CREATE_DEV_ANALYSIS_CACHE)
         try:
             await db.execute("ALTER TABLE open_positions ADD COLUMN peak_price REAL DEFAULT 0")
         except Exception:
@@ -1666,3 +1699,136 @@ async def get_pnl_report(user_id: int, days: int = 1) -> dict | None:
         "open_count": pos_row["cnt"],
         "total_invested": pos_row["total_invested"],
     }
+
+
+async def save_to_watchlist(token: dict) -> None:
+    """Save or update a token in the pump.fun watchlist."""
+    sql = """
+        INSERT INTO pumpfun_watchlist
+            (mint_address, name, symbol, creator, smart_score,
+             initial_price, peak_price, current_price,
+             bonding_progress, is_graduated, last_updated)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(mint_address) DO UPDATE SET
+            smart_score = MAX(pumpfun_watchlist.smart_score, excluded.smart_score),
+            peak_price = MAX(pumpfun_watchlist.peak_price, excluded.peak_price),
+            current_price = excluded.current_price,
+            bonding_progress = MAX(pumpfun_watchlist.bonding_progress, excluded.bonding_progress),
+            is_graduated = MAX(pumpfun_watchlist.is_graduated, excluded.is_graduated),
+            last_updated = CURRENT_TIMESTAMP
+    """
+    params = (
+        token.get("mint_address", token.get("contract_address", "")),
+        token.get("name", "Unknown"),
+        token.get("symbol", "???"),
+        token.get("creator", token.get("deployer_wallet", "")),
+        token.get("smart_score", 0),
+        token.get("initial_price", token.get("price_usd", 0)),
+        token.get("peak_price", token.get("price_usd", 0)),
+        token.get("current_price", token.get("price_usd", 0)),
+        token.get("bonding_progress", 0),
+        token.get("is_graduated", 0),
+    )
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        await db.execute(sql, params)
+        await db.commit()
+
+
+async def get_watchlist() -> list[dict]:
+    """Get all active watchlist tokens."""
+    sql = """
+        SELECT * FROM pumpfun_watchlist
+        WHERE dip_bought = 0
+        ORDER BY smart_score DESC, last_updated DESC
+    """
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(sql)
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def update_watchlist_price(mint: str, price: float) -> None:
+    """Update current price for a watchlist token."""
+    sql = """
+        UPDATE pumpfun_watchlist
+        SET current_price = ?,
+            peak_price = MAX(peak_price, ?),
+            last_updated = CURRENT_TIMESTAMP
+        WHERE mint_address = ?
+    """
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        await db.execute(sql, (price, price, mint))
+        await db.commit()
+
+
+async def mark_watchlist_dip_bought(mint: str) -> None:
+    """Mark a watchlist token as bought on dip."""
+    sql = """
+        UPDATE pumpfun_watchlist
+        SET dip_bought = 1, last_updated = CURRENT_TIMESTAMP
+        WHERE mint_address = ?
+    """
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        await db.execute(sql, (mint,))
+        await db.commit()
+
+
+async def remove_from_watchlist(mint: str) -> None:
+    """Remove a token from watchlist."""
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        await db.execute("DELETE FROM pumpfun_watchlist WHERE mint_address = ?", (mint,))
+        await db.commit()
+
+
+async def cache_dev_analysis(creator: str, analysis: dict) -> None:
+    """Cache dev wallet analysis result (TTL managed by caller)."""
+    if not creator:
+        return
+    flags = analysis.get("flags", [])
+    if isinstance(flags, list):
+        flags = json.dumps(flags)
+    sql = """
+        INSERT INTO dev_analysis_cache
+            (creator_address, tokens_created, success_rate, dev_score, flags, analyzed_at)
+        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(creator_address) DO UPDATE SET
+            tokens_created = excluded.tokens_created,
+            success_rate = excluded.success_rate,
+            dev_score = excluded.dev_score,
+            flags = excluded.flags,
+            analyzed_at = CURRENT_TIMESTAMP
+    """
+    params = (
+        creator,
+        analysis.get("tokens_created", 0),
+        analysis.get("success_rate", 0),
+        analysis.get("dev_score", 50),
+        flags,
+    )
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        await db.execute(sql, params)
+        await db.commit()
+
+
+async def get_cached_dev_analysis(creator: str, max_age_minutes: int = 30) -> dict | None:
+    """Get cached dev analysis if not expired."""
+    sql = """
+        SELECT * FROM dev_analysis_cache
+        WHERE creator_address = ?
+          AND analyzed_at >= datetime('now', ? || ' minutes')
+    """
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(sql, (creator, f"-{max_age_minutes}"))
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        flags = result.get("flags", "[]")
+        if isinstance(flags, str):
+            try:
+                result["flags"] = json.loads(flags)
+            except (json.JSONDecodeError, TypeError):
+                result["flags"] = []
+        return result

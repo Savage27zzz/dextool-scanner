@@ -157,6 +157,21 @@ async def scanner_loop():
                             logger.debug("Skipping blacklisted token %s", token.get("symbol"))
                             continue
 
+                        effective_score = token.get("smart_score", token.get("score", 0))
+                        recommendation = token.get("recommendation", "BUY" if effective_score >= MIN_SCORE else "SKIP")
+
+                        if recommendation == "SKIP":
+                            logger.debug("Skipping %s — recommendation: SKIP (score: %d)", token.get("symbol"), effective_score)
+                            continue
+
+                        if recommendation == "WATCH":
+                            logger.info("Watching %s — score %d, waiting for dip", token.get("symbol"), effective_score)
+                            try:
+                                await db.save_to_watchlist(token)
+                            except Exception:
+                                pass
+                            continue
+
                         await db.save_detected_token(token)
 
                         if alerts_enabled:
@@ -171,6 +186,20 @@ async def scanner_loop():
                                 f"💧 Liq: ${token.get('liquidity', 0):,.0f}\n"
                                 "━━━━━━━━━━━━━━━━━━━━━━"
                             )
+                            if token.get("source", "").startswith("pumpfun"):
+                                score_info = token.get("score_breakdown", {})
+                                alert_msg += (
+                                    f"\n🧠 <b>Smart Score:</b> {token.get('smart_score', 0)}/100\n"
+                                    f"  👤 Dev: {score_info.get('dev', '?')}/30  "
+                                    f"📦 Bundle: {score_info.get('bundles', '?')}/25\n"
+                                    f"  👥 Holders: {score_info.get('holders', '?')}/25  "
+                                    f"💡 Narrative: {score_info.get('narrative', '?')}/10"
+                                )
+                                flags = token.get("flags", [])
+                                if flags:
+                                    alert_msg += f"\n⚠️ Flags: {', '.join(flags)}"
+                                if token.get("source") == "pumpfun_dip":
+                                    alert_msg += f"\n📉 <b>Dip Buy:</b> {token.get('dip_percent', 0):.1f}% from initial"
                             tp = token.get("contract_address", "")[:16]
                             alert_markup = InlineKeyboardMarkup([
                                 [
@@ -362,6 +391,9 @@ async def cmd_help(update, context):
         lines.append("<b>⚙️ Settings:</b>")
         lines.append("/mysettings — View/edit your personal trading settings")
         lines.append("/compound — Auto-compound settings &amp; fund")
+        lines.append("/pumpfun — Toggle pump.fun scanner mode")
+        lines.append("/watchlist — Pump.fun dip-buy watchlist")
+        lines.append("/devscore &lt;address&gt; — Smart score a token")
         lines.append("/config — Current global bot configuration")
         if is_admin:
             lines.append("\n<b>Admin only:</b>")
@@ -391,6 +423,8 @@ async def cmd_help(update, context):
             from config import API_ENABLED, API_PORT
             lines.append(f"\nAPI: {'Enabled on port ' + str(API_PORT) if API_ENABLED else 'Disabled'}")
             lines.append(f"Sniper: {'Enabled' if SNIPER_ENABLED else 'Disabled'}")
+            from config import PUMPFUN_ENABLED as _PF_ENABLED
+            lines.append(f"Pump.fun: {'Enabled' if _PF_ENABLED else 'Disabled'}")
     else:
         uid = update.effective_user.id
         lines.append(f"Your user ID: <code>{uid}</code>")
@@ -2005,6 +2039,162 @@ async def cmd_fees(update, context):
     await update.message.reply_html("\n".join(msg_parts))
 
 
+
+
+async def cmd_pumpfun(update, context):
+    """Toggle pump.fun scanner on/off. Admin only."""
+    await _register_chat(update)
+    if not _is_admin(update):
+        await update.message.reply_text("Admin only.")
+        return
+    try:
+        import config as _cfg
+        _cfg.PUMPFUN_ENABLED = not _cfg.PUMPFUN_ENABLED
+        status = "\u2705 Enabled" if _cfg.PUMPFUN_ENABLED else "\u274c Disabled"
+        await update.message.reply_html(
+            f"\U0001f383 <b>Pump.fun Scanner:</b> {status}\n\n"
+            f"Smart scoring: {'Active' if _cfg.HELIUS_API_KEY else 'Limited (no Helius key)'}\n"
+            f"Min dev score: {_cfg.PUMPFUN_MIN_DEV_SCORE}\n"
+            f"Dip buy threshold: {_cfg.PUMPFUN_DIP_BUY_PCT}%\n"
+            f"Scan interval: {_cfg.PUMPFUN_SCAN_INTERVAL}s"
+        )
+    except Exception as exc:
+        logger.error("Error in /pumpfun command: %s", exc)
+        await update.message.reply_text(f"\u274c Error: {exc}")
+
+
+async def cmd_watchlist(update, context):
+    """Show pump.fun watchlist \u2014 tokens being tracked for dip-buy opportunities."""
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+    try:
+        items = await db.get_watchlist()
+        if not items:
+            await update.message.reply_text("\U0001f4ad Watchlist is empty. No tokens being tracked for dip buys.")
+            return
+
+        lines = [
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+            "\U0001f441 <b>PUMP.FUN WATCHLIST</b>",
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+            "",
+        ]
+
+        for item in items[:10]:
+            symbol = item.get("symbol", "???")
+            score = item.get("smart_score", 0)
+            initial = item.get("initial_price", 0)
+            current = item.get("current_price", 0)
+            bonding = item.get("bonding_progress", 0)
+            graduated = "\u2705" if item.get("is_graduated") else f"\U0001f7e1 {bonding:.0f}%"
+
+            if initial > 0 and current > 0:
+                dip_pct = ((initial - current) / initial) * 100
+                dip_str = f"{dip_pct:+.1f}%"
+            else:
+                dip_str = "\u2014"
+
+            mint = item.get("mint_address", "")
+            lines.append(
+                f"\U0001fA99 <b>{symbol}</b> | Score: {score}/100 | {graduated}\n"
+                f"   <code>{mint[:20]}...</code>\n"
+                f"   Init: ${initial:.8g} | Now: ${current:.8g} | {dip_str}"
+            )
+            lines.append("")
+
+        lines.append(f"Showing {min(len(items), 10)} of {len(items)} tracked tokens")
+        lines.append("\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501")
+
+        await update.message.reply_html("\n".join(lines))
+    except Exception as exc:
+        logger.error("Error in /watchlist command: %s", exc)
+        await update.message.reply_text(f"\u274c Error: {exc}")
+
+
+async def cmd_devscore(update, context):
+    """Run smart scoring on a specific token. Any user."""
+    await _register_chat(update)
+    if await _reject_unauthorized(update):
+        return
+
+    if not context.args or len(context.args) < 1:
+        await update.message.reply_html(
+            "Usage: <code>/devscore &lt;mint_address&gt;</code>\n"
+            "Example: <code>/devscore EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v</code>"
+        )
+        return
+
+    mint_address = context.args[0].strip()
+    await update.message.reply_text("\U0001f9e0 Running smart analysis\u2026")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            from pumpfun import get_coin_details, get_token_creator
+            details = await get_coin_details(session, mint_address)
+            name = details.get("name", "Unknown") if details else "Unknown"
+            symbol = details.get("symbol", "???") if details else "???"
+            creator = ""
+            if details:
+                creator = details.get("creator", "")
+            if not creator:
+                creator = await get_token_creator(session, mint_address) or ""
+            description = details.get("description", "") if details else ""
+
+            from dexscreener import get_token_liquidity
+            liq = await get_token_liquidity(session, "SOL", mint_address)
+            base_data = {"liquidity": liq, "market_cap": 0, "volume_24h": 0}
+            if details:
+                base_data["market_cap"] = details.get("market_cap", details.get("usd_market_cap", 0))
+
+            from smart_scorer import smart_score_token
+            result = await smart_score_token(
+                session,
+                mint=mint_address,
+                name=name,
+                symbol=symbol,
+                creator=creator,
+                description=description,
+                base_token_data=base_data,
+            )
+
+        bd = result.get("score_breakdown", {})
+        dev = result.get("dev_analysis", {})
+        bundle = result.get("bundle_analysis", {})
+        holder = result.get("holder_analysis", {})
+        flags = result.get("flags", [])
+
+        msg = (
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"\U0001f9e0 <b>SMART SCORE: {result.get('smart_score', 0)}/100</b>\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"\U0001fA99 <b>{name}</b> ({symbol})\n"
+            f"\U0001f4c4 <code>{mint_address}</code>\n\n"
+            f"\U0001f464 <b>Dev Analysis</b> ({bd.get('dev', '?')}/30)\n"
+            f"   Tokens created: {dev.get('tokens_created', 0)}\n"
+            f"   Success rate: {dev.get('success_rate', 0):.0f}%\n"
+            f"   Quick sells: {dev.get('quick_sells', 0)}\n"
+            f"   Dev score: {dev.get('dev_score', 50)}/100\n\n"
+            f"\U0001f4e6 <b>Bundle Check</b> ({bd.get('bundles', '?')}/25)\n"
+            f"   Bundled: {'Yes' if bundle.get('is_bundled') else 'No'}\n"
+            f"   Bundle wallets: {bundle.get('bundle_wallets', 0)}\n"
+            f"   Bundle %: {bundle.get('bundle_percent', 0):.1f}%\n\n"
+            f"\U0001f465 <b>Holder Analysis</b> ({bd.get('holders', '?')}/25)\n"
+            f"   Top 10 hold: {holder.get('top10_percent', 0):.1f}%\n"
+            f"   Top holder: {holder.get('top_holder_percent', 0):.1f}%\n\n"
+            f"\U0001f4a1 <b>Narrative</b> ({bd.get('narrative', '?')}/10)\n\n"
+            f"\u27a1\ufe0f <b>Recommendation:</b> {result.get('recommendation', 'N/A')}"
+        )
+        if flags:
+            msg += f"\n\u26a0\ufe0f <b>Flags:</b> {', '.join(flags)}"
+        msg += "\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+
+        await update.message.reply_html(msg)
+    except Exception as exc:
+        logger.error("Error in /devscore command: %s", exc)
+        await update.message.reply_text(f"\u274c Smart score failed: {exc}")
+
+
 async def post_init(application):
     global trader, monitor, notifier, whale_tracker, alerts_enabled, sniper
 
@@ -2046,7 +2236,13 @@ async def post_init(application):
     api_runner = await start_api_server()
 
     logger.info("Bot initialised – chain=%s, balance=%.6f %s, traders=%d", CHAIN, balance, native, len(trading_users))
-    scanner_mode = "DexTools + DexScreener" if DEXTOOLS_API_KEY else "DexScreener only (free)"
+    from config import PUMPFUN_ENABLED as _pf_on
+    if CHAIN.upper() == "SOL" and _pf_on:
+        scanner_mode = "Pump.fun (primary) + DexTools + DexScreener"
+    elif DEXTOOLS_API_KEY:
+        scanner_mode = "DexTools + DexScreener"
+    else:
+        scanner_mode = "DexScreener only (free)"
     await notifier.send_message(
         f"🤖 <b>DexTool Scanner Online</b>\n"
         f"Chain: {CHAIN} | Balance: {balance:.4f} {native}\n"
@@ -3815,6 +4011,9 @@ def main():
     app.add_handler(CommandHandler("orders", cmd_orders))
     app.add_handler(CommandHandler("pnl", cmd_pnl))
     app.add_handler(CommandHandler("compound", cmd_compound))
+    app.add_handler(CommandHandler("pumpfun", cmd_pumpfun))
+    app.add_handler(CommandHandler("watchlist", cmd_watchlist))
+    app.add_handler(CommandHandler("devscore", cmd_devscore))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     def _handle_signal(signum, frame):
