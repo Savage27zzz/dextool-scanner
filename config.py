@@ -84,6 +84,16 @@ SNIPER_ENABLED: bool = _env("SNIPER_ENABLED", default="false", cast=lambda v: v.
 SNIPER_CHECK_INTERVAL: int = _env("SNIPER_CHECK_INTERVAL", default="10", cast=int)
 SNIPER_MIN_LIQUIDITY: int = _env("SNIPER_MIN_LIQUIDITY", default="1000", cast=int)
 
+# Pump.fun scanner
+HELIUS_API_KEY: str = _env("HELIUS_API_KEY", default="")
+HELIUS_RPC_URL: str = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else ""
+PUMPFUN_ENABLED: bool = _env("PUMPFUN_ENABLED", default="true", cast=lambda v: v.lower() in ("true", "1", "yes"))
+PUMPFUN_SCAN_INTERVAL: int = _env("PUMPFUN_SCAN_INTERVAL", default="30", cast=int)
+PUMPFUN_MIN_BONDING_PCT: int = _env("PUMPFUN_MIN_BONDING_PCT", default="75", cast=int)  # pre-migration threshold
+PUMPFUN_MAX_AGE_HOURS: float = _env("PUMPFUN_MAX_AGE_HOURS", default="2.0", cast=float)  # post-migration max age
+PUMPFUN_MIN_DEV_SCORE: int = _env("PUMPFUN_MIN_DEV_SCORE", default="40", cast=int)
+PUMPFUN_DIP_BUY_PCT: int = _env("PUMPFUN_DIP_BUY_PCT", default="20", cast=int)  # buy at this % dip from initial
+
 SELL_TIERS_RAW: str = _env("SELL_TIERS", default="")
 
 
