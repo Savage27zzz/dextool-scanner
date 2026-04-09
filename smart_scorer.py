@@ -234,6 +234,39 @@ def _score_dev(analysis: dict) -> int:
     return max(0, min(100, score))
 
 
+async def _resolve_token_account_owners(
+    session: aiohttp.ClientSession, accounts: list[dict]
+) -> dict[str, str]:
+    """Resolve SPL token account addresses to their owner wallet addresses.
+
+    getTokenLargestAccounts returns token account addresses, not wallet addresses.
+    Each token account must be resolved via getAccountInfo to find its owner.
+
+    Returns {token_account_address: owner_wallet_address}.
+    """
+    mapping: dict[str, str] = {}
+    for acct in accounts:
+        addr = acct.get("address", "")
+        if not addr:
+            continue
+        try:
+            async with _HELIUS_SEM:
+                info = await helius.get_account_info(session, addr)
+            if info and isinstance(info, dict):
+                parsed = (info.get("value") or {}).get("data", {})
+                if isinstance(parsed, dict):
+                    owner = parsed.get("parsed", {}).get("info", {}).get("owner", "")
+                    if owner:
+                        mapping[addr] = owner
+                        continue
+                program_owner = (info.get("value") or {}).get("owner", "")
+                if program_owner:
+                    mapping[addr] = program_owner
+        except Exception as exc:
+            logger.debug("Failed to resolve token account %s: %s", addr[:12], exc)
+    return mapping
+
+
 # --- Bundle/Insider Detection ---
 
 async def detect_bundles(session: aiohttp.ClientSession, mint: str, creator: str) -> dict:
@@ -320,13 +353,13 @@ async def detect_bundles(session: aiohttp.ClientSession, mint: str, creator: str
             total_supply = float(supply_data.get("uiAmount", 0)) if supply_data else 0
 
             if total_supply > 0 and holders:
+                owner_map = await _resolve_token_account_owners(session, holders)
                 bundle_amount = 0.0
-                holder_addresses = {h["address"] for h in holders}
                 for h in holders:
-                    if h["address"] in bundle_wallets_set or h["address"] in holder_addresses:
+                    owner = owner_map.get(h["address"], "")
+                    if owner and owner in bundle_wallets_set:
                         ui_amount = float(h.get("uiAmount", 0) or 0)
-                        if h["address"] in bundle_wallets_set:
-                            bundle_amount += ui_amount
+                        bundle_amount += ui_amount
                 result["bundle_percent"] = (bundle_amount / total_supply) * 100 if total_supply > 0 else 0.0
         except Exception as exc:
             logger.debug("Bundle percent calculation failed for %s: %s", mint[:12], exc)
@@ -388,18 +421,21 @@ async def analyze_holders(session: aiohttp.ClientSession, mint: str) -> dict:
         top1_amount = float(top10[0].get("uiAmount", 0) or 0)
         result["top_holder_percent"] = round((top1_amount / total_supply) * 100, 2)
 
+    owner_map = await _resolve_token_account_owners(session, top10)
+
     recent_sellers = 0
     small_entry = 0
     hold_times: list[float] = []
     now = datetime.now(timezone.utc)
 
     for holder in top10[:5]:
-        addr = holder.get("address", "")
-        if not addr:
+        token_acct = holder.get("address", "")
+        wallet_addr = owner_map.get(token_acct, "")
+        if not wallet_addr:
             continue
         try:
             async with _HELIUS_SEM:
-                h_txns = await helius.get_wallet_transactions(session, addr, limit=20)
+                h_txns = await helius.get_wallet_transactions(session, wallet_addr, limit=20)
         except Exception:
             continue
         if not h_txns:
@@ -419,14 +455,14 @@ async def analyze_holders(session: aiohttp.ClientSession, mint: str) -> dict:
                         from_acct = tt.get("fromUserAccount", "")
                         to_acct = tt.get("toUserAccount", "")
 
-                        if to_acct == addr:
+                        if to_acct == wallet_addr:
                             if earliest_buy_ts == 0 or ts < earliest_buy_ts:
                                 earliest_buy_ts = ts
                             for nt in tx.get("nativeTransfers", []):
-                                if nt.get("fromUserAccount") == addr:
+                                if nt.get("fromUserAccount") == wallet_addr:
                                     entry_sol += abs(nt.get("amount", 0)) / 1e9
 
-                        elif from_acct == addr:
+                        elif from_acct == wallet_addr:
                             if ts > 0:
                                 try:
                                     tx_time = datetime.fromtimestamp(ts, tz=timezone.utc)
