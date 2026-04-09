@@ -497,10 +497,102 @@ async def fetch_token_research(session: aiohttp.ClientSession, chain: str, addre
 
 async def scan_all_sources(session: aiohttp.ClientSession, chain: str | None = None) -> list[dict]:
     """
-    Scan both DexTools and DexScreener, merge and deduplicate results.
-    DexTools is primary; DexScreener is fallback/supplement.
+    Scan all sources, with pump.fun as PRIMARY.
+
+    Priority order:
+    1. Pump.fun scanner (primary) — uses smart scoring
+    2. DexTools + DexScreener (secondary/fallback) — uses basic scoring
+
+    Pump.fun tokens use smart_score from smart_scorer.py.
+    DexTools/DexScreener tokens use the existing score_token() from scorer.py.
+
+    Merged results are deduped by contract address, pump.fun results take priority.
     """
     chain = (chain or CHAIN).upper()
+
+    if chain == "SOL":
+        from config import PUMPFUN_ENABLED
+
+        if PUMPFUN_ENABLED:
+            coros = []
+            labels = []
+
+            from pumpfun_scanner import scan_pumpfun_tokens, check_dip_buys
+            coros.append(scan_pumpfun_tokens(session))
+            labels.append("pumpfun")
+            coros.append(check_dip_buys(session))
+            labels.append("dip")
+
+            if DEXTOOLS_API_KEY:
+                coros.append(scan_for_new_tokens(session, chain))
+                labels.append("dextools")
+            coros.append(scan_dexscreener(session, chain))
+            labels.append("dexscreener")
+
+            raw_results = await asyncio.gather(*coros, return_exceptions=True)
+
+            results_map: dict[str, list[dict]] = {}
+            for label, res in zip(labels, raw_results):
+                if isinstance(res, Exception):
+                    logger.error("%s scanner failed: %s", label, res)
+                    results_map[label] = []
+                else:
+                    results_map[label] = res or []
+
+            pumpfun_results = results_map.get("pumpfun", [])
+            dip_results = results_map.get("dip", [])
+            dextools_results = results_map.get("dextools", [])
+            dexscreener_results = results_map.get("dexscreener", [])
+
+            seen: set[str] = set()
+            merged: list[dict] = []
+
+            for token in pumpfun_results:
+                addr = token.get("contract_address", "").lower()
+                if addr and addr not in seen:
+                    seen.add(addr)
+                    token["source"] = "pumpfun"
+                    merged.append(token)
+
+            for token in dip_results:
+                addr = token.get("contract_address", "").lower()
+                if addr and addr not in seen:
+                    seen.add(addr)
+                    token["source"] = "pumpfun_dip"
+                    merged.append(token)
+
+            for token in list(dextools_results) + list(dexscreener_results):
+                addr = token.get("contract_address", "").lower()
+                if addr and addr not in seen:
+                    seen.add(addr)
+                    score_token(token)
+                    merged.append(token)
+
+            merged.sort(key=lambda t: t.get("smart_score", t.get("score", 0)), reverse=True)
+
+            pf_count = len([t for t in merged if t.get("source", "").startswith("pumpfun")])
+            legacy_count = len(merged) - pf_count
+            logger.info(
+                "Combined scan: %d pump.fun + %d legacy = %d total",
+                pf_count, legacy_count, len(merged),
+            )
+
+            bought_addresses = set()
+            for t in merged:
+                addr = t.get("contract_address", "").lower()
+                if not addr:
+                    continue
+                rec = t.get("recommendation", "")
+                if rec == "BUY":
+                    bought_addresses.add(addr)
+                elif not rec and t.get("score", 0) >= MIN_SCORE:
+                    bought_addresses.add(addr)
+            try:
+                await db.save_scan_history_batch(merged, bought_addresses=bought_addresses)
+            except Exception as exc:
+                logger.error("Failed to save scan history: %s", exc)
+
+            return merged
 
     if DEXTOOLS_API_KEY:
         dextools_results, dexscreener_results = await asyncio.gather(
@@ -512,7 +604,7 @@ async def scan_all_sources(session: aiohttp.ClientSession, chain: str | None = N
             logger.error("DexTools scanner failed: %s", dextools_results)
             dextools_results = []
     else:
-        logger.info("DexTools API key not configured \u2014 using DexScreener only")
+        logger.info("DexTools API key not configured — using DexScreener only")
         dextools_results = []
         dexscreener_results = await scan_dexscreener(session, chain)
 
@@ -541,13 +633,10 @@ async def scan_all_sources(session: aiohttp.ClientSession, chain: str | None = N
         len(dextools_results), len(dexscreener_results), len(merged), len(seen_addresses),
     )
 
-    # Score all tokens
     scored = [score_token(t) for t in merged]
 
-    # Filter by minimum score
     qualified = [t for t in scored if t.get("score", 0) >= MIN_SCORE]
 
-    # Sort by score descending (best first)
     qualified.sort(key=lambda t: t.get("score", 0), reverse=True)
 
     logger.info(
